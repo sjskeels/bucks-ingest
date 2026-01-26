@@ -83,8 +83,7 @@ def require_parse_token() -> None:
     """
     expected = os.getenv("PARSE_TOKEN", "").strip()
     if not expected:
-        # If not set, allow in local dev only (not ideal, but keeps MVP moving).
-        # On Railway you should set PARSE_TOKEN.
+        # If not set, allow in local dev only.
         return
     got = (request.headers.get("X-Parse-Token") or "").strip()
     if got != expected:
@@ -113,8 +112,7 @@ def _money_to_decimal(s: str) -> Decimal | None:
 
 def extract_salesstat_kpis(pdf_bytes: bytes) -> dict:
     """
-    Heuristic extractor. We are NOT doing perfect PDF parsing yet —
-    we’re pulling the main KPIs from rendered text using label matching.
+    Heuristic extractor. MVP: pull main KPIs from rendered text using label matching.
     """
     reader = PdfReader(BytesIO(pdf_bytes))
     text_parts = []
@@ -133,7 +131,6 @@ def extract_salesstat_kpis(pdf_bytes: bytes) -> dict:
             if any(lbl in lnl for lbl in label_variants):
                 m = _money_re.findall(ln)
                 if m:
-                    # take last money-looking number on the line
                     return _money_to_decimal(m[-1])
         return None
 
@@ -154,9 +151,8 @@ def extract_salesstat_kpis(pdf_bytes: bytes) -> dict:
     transactions = find_int(["transactions", "transaction count", "trx"])
     avg_ticket = find_money(["avg ticket", "average ticket", "avg. ticket"])
 
-    # If we failed, return some debug (safe length) so we can tune labels.
     if net_sales is None and gross_sales is None and transactions is None and avg_ticket is None:
-        sample = "\n".join(lines[:60])
+        sample = "\n".join(lines[:80])
         raise ValueError(f"Could not extract KPIs from PDF text. Sample:\n{sample}")
 
     return {
@@ -252,72 +248,81 @@ def parse_salesstat_latest():
     except PermissionError as e:
         return jsonify({"ok": False, "error": str(e)}), 401
 
-    with connect(get_db_url()) as conn:
-        with conn.cursor() as cur:
-            # Pull latest SalesStat PDF
-            cur.execute(
-                """
-                select id, business_date, filename, sha256, file_bytes
-                from raw.inbound_files
-                where report_type = 'salesstat'
-                order by received_at desc
-                limit 1
-                """
-            )
-            row = cur.fetchone()
-            if not row:
-                return jsonify({"ok": False, "error": "No salesstat PDFs found in raw.inbound_files"}), 404
+    try:
+        with connect(get_db_url()) as conn:
+            with conn.cursor() as cur:
+                # Pull latest SalesStat PDF
+                cur.execute(
+                    """
+                    select id, business_date, filename, sha256, file_bytes
+                    from raw.inbound_files
+                    where report_type = 'salesstat'
+                    order by received_at desc
+                    limit 1
+                    """
+                )
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"ok": False, "error": "No salesstat PDFs found in raw.inbound_files"}), 404
 
-            file_id, biz_date, filename, sha256, pdf_bytes = row
-            if not biz_date:
-                return jsonify(
-                    {"ok": False, "error": "Latest salesstat PDF missing business_date; cannot parse into daily table", "id": file_id}
-                ), 400
+                file_id, biz_date, filename, sha256, pdf_bytes = row
+                if not biz_date:
+                    return jsonify(
+                        {
+                            "ok": False,
+                            "error": "Latest salesstat PDF missing business_date; cannot parse into daily table",
+                            "id": file_id,
+                        }
+                    ), 400
 
-            # Extract KPIs from PDF text
-            kpis = extract_salesstat_kpis(pdf_bytes)
+                # Extract KPIs from PDF text
+                kpis = extract_salesstat_kpis(pdf_bytes)
 
-            # Upsert into analytics table (overwrites placeholder zeros once we have real numbers)
-            cur.execute(
-                """
-                insert into analytics.salesstat_daily
-                  (business_date, net_sales, gross_sales, transactions, avg_ticket, updated_at)
-                values
-                  (%s, %s, %s, %s, %s, now())
-                on conflict (business_date) do update
-                  set net_sales = excluded.net_sales,
-                      gross_sales = excluded.gross_sales,
-                      transactions = excluded.transactions,
-                      avg_ticket = excluded.avg_ticket,
-                      updated_at = now()
-                returning business_date, net_sales, gross_sales, transactions, avg_ticket, updated_at
-                """,
-                (
-                    biz_date,
-                    Decimal(kpis["net_sales"]) if kpis["net_sales"] is not None else None,
-                    Decimal(kpis["gross_sales"]) if kpis["gross_sales"] is not None else None,
-                    kpis["transactions"],
-                    Decimal(kpis["avg_ticket"]) if kpis["avg_ticket"] is not None else None,
-                ),
-            )
-            out = cur.fetchone()
+                # Upsert into analytics table (overwrites placeholder zeros once we have real numbers)
+                cur.execute(
+                    """
+                    insert into analytics.salesstat_daily
+                      (business_date, net_sales, gross_sales, transactions, avg_ticket, updated_at)
+                    values
+                      (%s, %s, %s, %s, %s, now())
+                    on conflict (business_date) do update
+                      set net_sales = excluded.net_sales,
+                          gross_sales = excluded.gross_sales,
+                          transactions = excluded.transactions,
+                          avg_ticket = excluded.avg_ticket,
+                          updated_at = now()
+                    returning business_date, net_sales, gross_sales, transactions, avg_ticket, updated_at
+                    """,
+                    (
+                        biz_date,
+                        Decimal(kpis["net_sales"]) if kpis["net_sales"] is not None else None,
+                        Decimal(kpis["gross_sales"]) if kpis["gross_sales"] is not None else None,
+                        kpis["transactions"],
+                        Decimal(kpis["avg_ticket"]) if kpis["avg_ticket"] is not None else None,
+                    ),
+                )
+                out = cur.fetchone()
 
-    app.logger.info("Parsed salesstat: id=%s sha256=%s business_date=%s kpis=%s", file_id, sha256, biz_date, kpis)
+        app.logger.info("Parsed salesstat: id=%s sha256=%s business_date=%s kpis=%s", file_id, sha256, biz_date, kpis)
 
-    return jsonify(
-        {
-            "ok": True,
-            "source": {"id": file_id, "filename": filename, "sha256": sha256, "business_date": str(biz_date)},
-            "upserted": {
-                "business_date": str(out[0]),
-                "net_sales": str(out[1]) if out[1] is not None else None,
-                "gross_sales": str(out[2]) if out[2] is not None else None,
-                "transactions": out[3],
-                "avg_ticket": str(out[4]) if out[4] is not None else None,
-                "updated_at": out[5].isoformat() if out[5] is not None else None,
-            },
-        }
-    )
+        return jsonify(
+            {
+                "ok": True,
+                "source": {"id": file_id, "filename": filename, "sha256": sha256, "business_date": str(biz_date)},
+                "upserted": {
+                    "business_date": str(out[0]),
+                    "net_sales": str(out[1]) if out[1] is not None else None,
+                    "gross_sales": str(out[2]) if out[2] is not None else None,
+                    "transactions": out[3],
+                    "avg_ticket": str(out[4]) if out[4] is not None else None,
+                    "updated_at": out[5].isoformat() if out[5] is not None else None,
+                },
+            }
+        )
+
+    except Exception as e:
+        app.logger.exception("parse_salesstat_latest failed")
+        return jsonify({"ok": False, "error_type": type(e).__name__, "error": str(e)}), 500
 
 
 if __name__ == "__main__":
