@@ -2,9 +2,12 @@
 import hashlib
 import re
 from datetime import datetime, date
+from io import BytesIO
+from decimal import Decimal
 
 from flask import Flask, request, jsonify
 from psycopg import connect
+from pypdf import PdfReader
 
 app = Flask(__name__)
 
@@ -14,7 +17,6 @@ app = Flask(__name__)
 # We infer from filename and/or email subject.
 
 _REPORT_PREFIX_MAP = {
-    # filename prefix -> report_type
     "salesstatreport": "salesstat",
     "salesclass": "salesclass",
 }
@@ -28,7 +30,6 @@ def infer_report_type(filename: str | None, subject: str | None) -> str | None:
         if fn.startswith(prefix):
             return rtype
 
-    # subject-based fallback (cheap wins)
     if "daily sales statistics" in sub:
         return "salesstat"
 
@@ -38,12 +39,10 @@ def infer_report_type(filename: str | None, subject: str | None) -> str | None:
 def infer_business_date(filename: str | None, subject: str | None) -> date | None:
     """
     Try to infer business date from common patterns.
-    Example filename: salesstatreport012526020108.PDF
-      -> MMDDYY = 01/25/26
+    Example filename: salesstatreport012526020108.PDF -> MMDDYY = 01/25/26
     """
     fn = (filename or "")
 
-    # Pattern: <prefix><MMDDYY>...
     m = re.search(r"(salesstatreport|salesclass)(\d{6})", fn, flags=re.IGNORECASE)
     if m:
         mmddyy = m.group(2)
@@ -52,7 +51,6 @@ def infer_business_date(filename: str | None, subject: str | None) -> date | Non
         except ValueError:
             pass
 
-    # Optional subject patterns: "... 2026-01-25" or "01/25/2026"
     sub = (subject or "")
     m = re.search(r"(\d{4}-\d{2}-\d{2})", sub)
     if m:
@@ -78,6 +76,97 @@ def get_db_url() -> str:
     return db_url
 
 
+def require_parse_token() -> None:
+    """
+    Simple safety valve so we don't expose parsing to the public internet.
+    Set PARSE_TOKEN on Railway. Call with header: X-Parse-Token: <token>
+    """
+    expected = os.getenv("PARSE_TOKEN", "").strip()
+    if not expected:
+        # If not set, allow in local dev only (not ideal, but keeps MVP moving).
+        # On Railway you should set PARSE_TOKEN.
+        return
+    got = (request.headers.get("X-Parse-Token") or "").strip()
+    if got != expected:
+        raise PermissionError("Missing/invalid X-Parse-Token")
+
+
+_money_re = re.compile(r"(\(?-?\$?\d[\d,]*\.\d{2}\)?)")
+_int_re = re.compile(r"(\d[\d,]*)")
+
+
+def _money_to_decimal(s: str) -> Decimal | None:
+    if not s:
+        return None
+    s = s.strip()
+    neg = False
+    if s.startswith("(") and s.endswith(")"):
+        neg = True
+        s = s[1:-1]
+    s = s.replace("$", "").replace(",", "").strip()
+    try:
+        val = Decimal(s)
+        return -val if neg else val
+    except Exception:
+        return None
+
+
+def extract_salesstat_kpis(pdf_bytes: bytes) -> dict:
+    """
+    Heuristic extractor. We are NOT doing perfect PDF parsing yet —
+    we’re pulling the main KPIs from rendered text using label matching.
+    """
+    reader = PdfReader(BytesIO(pdf_bytes))
+    text_parts = []
+    for p in reader.pages:
+        t = p.extract_text() or ""
+        text_parts.append(t)
+    text = "\n".join(text_parts)
+
+    # Normalize
+    lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines()]
+    lines = [ln for ln in lines if ln]
+
+    def find_money(label_variants: list[str]) -> Decimal | None:
+        for ln in lines:
+            lnl = ln.lower()
+            if any(lbl in lnl for lbl in label_variants):
+                m = _money_re.findall(ln)
+                if m:
+                    # take last money-looking number on the line
+                    return _money_to_decimal(m[-1])
+        return None
+
+    def find_int(label_variants: list[str]) -> int | None:
+        for ln in lines:
+            lnl = ln.lower()
+            if any(lbl in lnl for lbl in label_variants):
+                m = _int_re.findall(ln)
+                if m:
+                    try:
+                        return int(m[-1].replace(",", ""))
+                    except Exception:
+                        return None
+        return None
+
+    net_sales = find_money(["net sales", "net sales:"])
+    gross_sales = find_money(["gross sales", "gross sales:"])
+    transactions = find_int(["transactions", "transaction count", "trx"])
+    avg_ticket = find_money(["avg ticket", "average ticket", "avg. ticket"])
+
+    # If we failed, return some debug (safe length) so we can tune labels.
+    if net_sales is None and gross_sales is None and transactions is None and avg_ticket is None:
+        sample = "\n".join(lines[:60])
+        raise ValueError(f"Could not extract KPIs from PDF text. Sample:\n{sample}")
+
+    return {
+        "net_sales": str(net_sales) if net_sales is not None else None,
+        "gross_sales": str(gross_sales) if gross_sales is not None else None,
+        "transactions": transactions,
+        "avg_ticket": str(avg_ticket) if avg_ticket is not None else None,
+    }
+
+
 @app.get("/health")
 def health():
     return jsonify({"ok": True})
@@ -101,7 +190,6 @@ def mailgun_inbound():
 
     stored = []
 
-    # Iterate attachments: Mailgun uses attachment-1, attachment-2, ...
     for key in files:
         f = files[key]
         if not f:
@@ -155,3 +243,83 @@ def mailgun_inbound():
         )
 
     return jsonify({"ok": True, "stored": stored})
+
+
+@app.post("/parse/salesstat/latest")
+def parse_salesstat_latest():
+    try:
+        require_parse_token()
+    except PermissionError as e:
+        return jsonify({"ok": False, "error": str(e)}), 401
+
+    with connect(get_db_url()) as conn:
+        with conn.cursor() as cur:
+            # Pull latest SalesStat PDF
+            cur.execute(
+                """
+                select id, business_date, filename, sha256, file_bytes
+                from raw.inbound_files
+                where report_type = 'salesstat'
+                order by received_at desc
+                limit 1
+                """
+            )
+            row = cur.fetchone()
+            if not row:
+                return jsonify({"ok": False, "error": "No salesstat PDFs found in raw.inbound_files"}), 404
+
+            file_id, biz_date, filename, sha256, pdf_bytes = row
+            if not biz_date:
+                return jsonify(
+                    {"ok": False, "error": "Latest salesstat PDF missing business_date; cannot parse into daily table", "id": file_id}
+                ), 400
+
+            # Extract KPIs from PDF text
+            kpis = extract_salesstat_kpis(pdf_bytes)
+
+            # Upsert into analytics table (overwrites placeholder zeros once we have real numbers)
+            cur.execute(
+                """
+                insert into analytics.salesstat_daily
+                  (business_date, net_sales, gross_sales, transactions, avg_ticket, updated_at)
+                values
+                  (%s, %s, %s, %s, %s, now())
+                on conflict (business_date) do update
+                  set net_sales = excluded.net_sales,
+                      gross_sales = excluded.gross_sales,
+                      transactions = excluded.transactions,
+                      avg_ticket = excluded.avg_ticket,
+                      updated_at = now()
+                returning business_date, net_sales, gross_sales, transactions, avg_ticket, updated_at
+                """,
+                (
+                    biz_date,
+                    Decimal(kpis["net_sales"]) if kpis["net_sales"] is not None else None,
+                    Decimal(kpis["gross_sales"]) if kpis["gross_sales"] is not None else None,
+                    kpis["transactions"],
+                    Decimal(kpis["avg_ticket"]) if kpis["avg_ticket"] is not None else None,
+                ),
+            )
+            out = cur.fetchone()
+
+    app.logger.info("Parsed salesstat: id=%s sha256=%s business_date=%s kpis=%s", file_id, sha256, biz_date, kpis)
+
+    return jsonify(
+        {
+            "ok": True,
+            "source": {"id": file_id, "filename": filename, "sha256": sha256, "business_date": str(biz_date)},
+            "upserted": {
+                "business_date": str(out[0]),
+                "net_sales": str(out[1]) if out[1] is not None else None,
+                "gross_sales": str(out[2]) if out[2] is not None else None,
+                "transactions": out[3],
+                "avg_ticket": str(out[4]) if out[4] is not None else None,
+                "updated_at": out[5].isoformat() if out[5] is not None else None,
+            },
+        }
+    )
+
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)
