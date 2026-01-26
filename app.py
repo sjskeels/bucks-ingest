@@ -1,142 +1,121 @@
-import os
+﻿import os
 import hashlib
-import re
-from datetime import datetime
-from flask import Flask, request, abort
-import psycopg2
-import requests
+import logging
+from datetime import datetime, timezone
 
-app = Flask(__name__)
+from flask import Flask, request, jsonify
 
-# --- helpers -------------------------------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("bucks-ingest")
 
-def db_conn():
-    """
-    Railway Postgres: use DATABASE_URL if present.
-    """
-    dsn = os.environ.get("DATABASE_URL")
-    if not dsn:
-        raise RuntimeError("DATABASE_URL is not set in Railway variables.")
-    return psycopg2.connect(dsn)
+INSERT_SQL = """
+INSERT INTO raw.inbound_files (
+  received_at,
+  mail_from,
+  mail_subject,
+  mail_message_id,
+  filename,
+  content_type,
+  file_bytes,
+  sha256
+)
+VALUES (
+  %(received_at)s,
+  %(mail_from)s,
+  %(mail_subject)s,
+  %(mail_message_id)s,
+  %(filename)s,
+  %(content_type)s,
+  %(file_bytes)s,
+  %(sha256)s
+)
+ON CONFLICT (sha256) DO NOTHING
+RETURNING id;
+"""
 
-def guess_report_type(filename: str, subject: str) -> str:
-    """
-    MVP heuristic ONLY. We will refine later.
-    """
-    s = f"{filename} {subject}".lower()
+def get_conn():
+    # Lazy import so local /health runs without DB deps installed.
+    import psycopg
+    db_url = os.getenv("DATABASE_URL")
+    if not db_url:
+        raise RuntimeError("DATABASE_URL is not set")
+    return psycopg.connect(db_url)
 
-    # common TransAct patterns / your report names
-    if "salesstat" in s or "daily sales statistic" in s or "daily sales statistics" in s:
-        return "salesstat"
-    if "arinvreg" in s or "daily invoice list" in s or "invoice list" in s:
-        return "arinvreg"
-    if "salesclass" in s or "sales by class" in s:
-        return "salesclass"
+def create_app():
+    app = Flask(__name__)
 
-    return "unknown"
+    @app.get("/health")
+    def health():
+        return {"ok": True}, 200
 
-def extract_business_date(subject: str, body_text: str) -> str | None:
-    """
-    Best-effort: try to find a date like 01/12/26 or 2026-01-12.
-    Returns ISO date string 'YYYY-MM-DD' or None.
-    """
-    hay = f"{subject}\n{body_text}"
+    @app.post("/mailgun/inbound")
+    def mailgun_inbound():
+        mail_from = request.form.get("sender") or request.form.get("from") or ""
+        subject = request.form.get("subject") or ""
+        message_id = request.form.get("Message-Id") or request.form.get("message-id") or ""
 
-    # match mm/dd/yy
-    m = re.search(r"\b(0?[1-9]|1[0-2])/(0?[1-9]|[12]\d|3[01])/(?:\d{2})\b", hay)
-    if m:
-        mm, dd, yy = m.group(0).split("/")
-        yy = int(yy)
-        yy += 2000 if yy < 70 else 1900
-        dt = datetime(yy, int(mm), int(dd))
-        return dt.strftime("%Y-%m-%d")
+        logger.info(
+            "Inbound email: from=%r subject=%r message_id=%r form_keys=%s file_keys=%s",
+            mail_from, subject, message_id,
+            sorted(list(request.form.keys())),
+            sorted(list(request.files.keys()))
+        )
 
-    # match yyyy-mm-dd
-    m = re.search(r"\b(20\d{2})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b", hay)
-    if m:
-        return m.group(0)
+        # If we’re running locally without DATABASE_URL, fail clearly.
+        if not os.getenv("DATABASE_URL"):
+            return jsonify({"ok": False, "error": "DATABASE_URL not set (expected on Railway)"}), 500
 
-    return None
+        stored = 0
+        deduped = 0
+        results = []
 
-# --- routes ---------------------------------------------------
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                for key in request.files:
+                    f = request.files.get(key)
+                    if not f:
+                        continue
 
-@app.get("/")
-def health():
-    return {"ok": True}
+                    filename = f.filename or "unknown"
+                    content_type = f.content_type or "application/octet-stream"
+                    file_bytes = f.read()
 
-@app.post("/mailgun/inbound")
-def inbound():
-    """
-    Mailgun routes -> forward to this endpoint.
-    We store each PDF attachment as a row in raw.inbound_files.
-    """
-    # Optional shared secret (recommended). If set, require it.
-    expected = os.environ.get("INGEST_SECRET")
-    if expected:
-        got = request.headers.get("X-Ingest-Secret") or request.args.get("secret")
-        if got != expected:
-            abort(401, "unauthorized")
+                    if not file_bytes or len(file_bytes) < 100:
+                        logger.warning("Skipping tiny/empty file: key=%s filename=%s bytes=%s",
+                                       key, filename, len(file_bytes) if file_bytes else 0)
+                        continue
 
-    mail_from = request.form.get("from") or request.form.get("sender")
-    mail_subject = request.form.get("subject")
-    mail_message_id = request.form.get("Message-Id") or request.form.get("message-id")
+                    sha256 = hashlib.sha256(file_bytes).hexdigest()
 
-    # Find attachments (Mailgun sends as files: attachment-1, attachment-2, ...)
-    attachments = []
-    for key in request.files:
-        if key.startswith("attachment-"):
-            attachments.append((key, request.files[key]))
+                    payload = {
+                        "received_at": datetime.now(timezone.utc),
+                        "mail_from": mail_from,
+                        "mail_subject": subject,
+                        "mail_message_id": message_id,
+                        "filename": filename,
+                        "content_type": content_type,
+                        "file_bytes": file_bytes,
+                        "sha256": sha256,
+                    }
 
-    if not attachments:
-        # Nothing to ingest, but don't fail Mailgun
-        return {"ok": True, "ingested": 0, "reason": "no attachments"}, 200
+                    cur.execute(INSERT_SQL, payload)
+                    row = cur.fetchone()
+                    if row and row[0] is not None:
+                        stored += 1
+                        results.append({"key": key, "filename": filename, "bytes": len(file_bytes), "sha256": sha256, "id": row[0]})
+                        logger.info("Stored: id=%s filename=%s bytes=%s sha256=%s", row[0], filename, len(file_bytes), sha256)
+                    else:
+                        deduped += 1
+                        results.append({"key": key, "filename": filename, "bytes": len(file_bytes), "sha256": sha256, "deduped": True})
+                        logger.info("Deduped: filename=%s sha256=%s", filename, sha256)
 
-    ingested = 0
+        return jsonify({"ok": True, "stored": stored, "deduped": deduped, "files": results}), 200
 
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            for key, f in attachments:
-                filename = f.filename or "attachment.pdf"
-                content_type = f.mimetype or "application/octet-stream"
-                file_bytes = f.read()
+    return app
 
-                if not file_bytes:
-                    continue
-
-                sha256 = hashlib.sha256(file_bytes).hexdigest()
-
-                # Small text fields that sometimes help infer date/type
-                stripped_text = (request.form.get("stripped-text") or "")[:10000]
-                business_date = extract_business_date(mail_subject or "", stripped_text)
-
-                report_type = guess_report_type(filename, mail_subject or "")
-
-                cur.execute(
-                    """
-                    INSERT INTO raw.inbound_files
-                      (mail_from, mail_subject, mail_message_id,
-                       filename, content_type, file_bytes, sha256, report_type, business_date)
-                    VALUES
-                      (%s, %s, %s,
-                       %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (sha256) DO NOTHING
-                    """,
-                    (
-                        mail_from,
-                        mail_subject,
-                        mail_message_id,
-                        filename,
-                        content_type,
-                        psycopg2.Binary(file_bytes),
-                        sha256,
-                        report_type,
-                        business_date,
-                    ),
-                )
-                ingested += 1
-
-    return {"ok": True, "ingested": ingested}, 200
+app = create_app()
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))
+    port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
