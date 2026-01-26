@@ -78,12 +78,12 @@ def get_db_url() -> str:
 
 def require_parse_token() -> None:
     """
-    Simple safety valve so we don't expose parsing to the public internet.
+    Safety valve so parsing isn't public.
     Set PARSE_TOKEN on Railway. Call with header: X-Parse-Token: <token>
+    If PARSE_TOKEN is unset, allow (local dev convenience).
     """
     expected = os.getenv("PARSE_TOKEN", "").strip()
     if not expected:
-        # If not set, allow in local dev only.
         return
     got = (request.headers.get("X-Parse-Token") or "").strip()
     if got != expected:
@@ -112,16 +112,23 @@ def _money_to_decimal(s: str) -> Decimal | None:
 
 def extract_salesstat_kpis(pdf_bytes: bytes) -> dict:
     """
-    Heuristic extractor. MVP: pull main KPIs from rendered text using label matching.
+    TransAct "Sales Statistics Report" extractor (MVP).
+
+    Map TransAct labels -> our analytics columns:
+      net_sales    <- "Sales SubTotal"
+      gross_sales  <- "Total Sales and Tax"
+      transactions <- "Number of Invoices" (or "Daily Invoices")
+      avg_ticket   <- "Average Invoice Amount"
     """
     reader = PdfReader(BytesIO(pdf_bytes))
+
     text_parts = []
     for p in reader.pages:
         t = p.extract_text() or ""
         text_parts.append(t)
     text = "\n".join(text_parts)
 
-    # Normalize
+    # Normalize lines
     lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines()]
     lines = [ln for ln in lines if ln]
 
@@ -146,20 +153,27 @@ def extract_salesstat_kpis(pdf_bytes: bytes) -> dict:
                         return None
         return None
 
-    net_sales = find_money(["net sales", "net sales:"])
-    gross_sales = find_money(["gross sales", "gross sales:"])
-    transactions = find_int(["transactions", "transaction count", "trx"])
-    avg_ticket = find_money(["avg ticket", "average ticket", "avg. ticket"])
+    sales_subtotal = find_money(["sales subtotal"])
+    total_sales_and_tax = find_money(["total sales and tax"])
+    avg_invoice_amount = find_money(["average invoice amount"])
 
-    if net_sales is None and gross_sales is None and transactions is None and avg_ticket is None:
+    invoices = find_int(["number of invoices", "daily invoices"])
+
+    # If nothing found, throw a helpful error sample
+    if (
+        sales_subtotal is None
+        and total_sales_and_tax is None
+        and avg_invoice_amount is None
+        and invoices is None
+    ):
         sample = "\n".join(lines[:80])
         raise ValueError(f"Could not extract KPIs from PDF text. Sample:\n{sample}")
 
     return {
-        "net_sales": str(net_sales) if net_sales is not None else None,
-        "gross_sales": str(gross_sales) if gross_sales is not None else None,
-        "transactions": transactions,
-        "avg_ticket": str(avg_ticket) if avg_ticket is not None else None,
+        "net_sales": str(sales_subtotal) if sales_subtotal is not None else None,
+        "gross_sales": str(total_sales_and_tax) if total_sales_and_tax is not None else None,
+        "transactions": invoices,
+        "avg_ticket": str(avg_invoice_amount) if avg_invoice_amount is not None else None,
     }
 
 
@@ -251,7 +265,6 @@ def parse_salesstat_latest():
     try:
         with connect(get_db_url()) as conn:
             with conn.cursor() as cur:
-                # Pull latest SalesStat PDF
                 cur.execute(
                     """
                     select id, business_date, filename, sha256, file_bytes
@@ -275,10 +288,8 @@ def parse_salesstat_latest():
                         }
                     ), 400
 
-                # Extract KPIs from PDF text
                 kpis = extract_salesstat_kpis(pdf_bytes)
 
-                # Upsert into analytics table (overwrites placeholder zeros once we have real numbers)
                 cur.execute(
                     """
                     insert into analytics.salesstat_daily
