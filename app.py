@@ -1,121 +1,157 @@
 ﻿import os
 import hashlib
-import logging
-from datetime import datetime, timezone
+import re
+from datetime import datetime, date
 
 from flask import Flask, request, jsonify
+from psycopg import connect
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("bucks-ingest")
+app = Flask(__name__)
 
-INSERT_SQL = """
-INSERT INTO raw.inbound_files (
-  received_at,
-  mail_from,
-  mail_subject,
-  mail_message_id,
-  filename,
-  content_type,
-  file_bytes,
-  sha256
-)
-VALUES (
-  %(received_at)s,
-  %(mail_from)s,
-  %(mail_subject)s,
-  %(mail_message_id)s,
-  %(filename)s,
-  %(content_type)s,
-  %(file_bytes)s,
-  %(sha256)s
-)
-ON CONFLICT (sha256) DO NOTHING
-RETURNING id;
-"""
 
-def get_conn():
-    # Lazy import so local /health runs without DB deps installed.
-    import psycopg
+# --- Report metadata extraction (MVP) ---
+# Goal: populate report_type + business_date WITHOUT parsing PDF contents.
+# We infer from filename and/or email subject.
+
+_REPORT_PREFIX_MAP = {
+    # filename prefix -> report_type
+    "salesstatreport": "salesstat",
+    "salesclass": "salesclass",
+}
+
+
+def infer_report_type(filename: str | None, subject: str | None) -> str | None:
+    fn = (filename or "").lower()
+    sub = (subject or "").lower()
+
+    for prefix, rtype in _REPORT_PREFIX_MAP.items():
+        if fn.startswith(prefix):
+            return rtype
+
+    # subject-based fallback (cheap wins)
+    if "daily sales statistics" in sub:
+        return "salesstat"
+
+    return None
+
+
+def infer_business_date(filename: str | None, subject: str | None) -> date | None:
+    """
+    Try to infer business date from common patterns.
+    Example filename: salesstatreport012526020108.PDF
+      -> MMDDYY = 01/25/26
+    """
+    fn = (filename or "")
+
+    # Pattern: <prefix><MMDDYY>...
+    m = re.search(r"(salesstatreport|salesclass)(\d{6})", fn, flags=re.IGNORECASE)
+    if m:
+        mmddyy = m.group(2)
+        try:
+            return datetime.strptime(mmddyy, "%m%d%y").date()
+        except ValueError:
+            pass
+
+    # Optional subject patterns: "... 2026-01-25" or "01/25/2026"
+    sub = (subject or "")
+    m = re.search(r"(\d{4}-\d{2}-\d{2})", sub)
+    if m:
+        try:
+            return datetime.strptime(m.group(1), "%Y-%m-%d").date()
+        except ValueError:
+            pass
+
+    m = re.search(r"(\d{2}/\d{2}/\d{4})", sub)
+    if m:
+        try:
+            return datetime.strptime(m.group(1), "%m/%d/%Y").date()
+        except ValueError:
+            pass
+
+    return None
+
+
+def get_db_url() -> str:
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
-        raise RuntimeError("DATABASE_URL is not set")
-    return psycopg.connect(db_url)
+        raise RuntimeError("DATABASE_URL not set (expected on Railway)")
+    return db_url
 
-def create_app():
-    app = Flask(__name__)
 
-    @app.get("/health")
-    def health():
-        return {"ok": True}, 200
+@app.get("/health")
+def health():
+    return jsonify({"ok": True})
 
-    @app.post("/mailgun/inbound")
-    def mailgun_inbound():
-        mail_from = request.form.get("sender") or request.form.get("from") or ""
-        subject = request.form.get("subject") or ""
-        message_id = request.form.get("Message-Id") or request.form.get("message-id") or ""
 
-        logger.info(
-            "Inbound email: from=%r subject=%r message_id=%r form_keys=%s file_keys=%s",
-            mail_from, subject, message_id,
-            sorted(list(request.form.keys())),
-            sorted(list(request.files.keys()))
+@app.post("/mailgun/inbound")
+def mailgun_inbound():
+    sender = request.form.get("sender", "") or request.form.get("from", "")
+    subject = request.form.get("subject", "")
+    message_id = request.form.get("message-id", "") or request.form.get("Message-Id", "")
+
+    files = request.files
+    app.logger.info(
+        "Inbound email: from=%r subject=%r message_id=%r form_keys=%s file_keys=%s",
+        sender,
+        subject,
+        message_id,
+        list(request.form.keys()),
+        list(files.keys()),
+    )
+
+    stored = []
+
+    # Iterate attachments: Mailgun uses attachment-1, attachment-2, ...
+    for key in files:
+        f = files[key]
+        if not f:
+            continue
+
+        filename = f.filename or "attachment.bin"
+        content_type = f.content_type or "application/octet-stream"
+        blob = f.read() or b""
+        sha256 = hashlib.sha256(blob).hexdigest()
+
+        report_type = infer_report_type(filename, subject)
+        business_date = infer_business_date(filename, subject)
+
+        with connect(get_db_url()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO raw.inbound_files
+                      (received_at, mail_from, mail_subject, mail_message_id,
+                       filename, content_type, file_bytes, sha256, report_type, business_date)
+                    VALUES (now(), %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (sha256) DO UPDATE
+                      SET report_type   = COALESCE(raw.inbound_files.report_type, EXCLUDED.report_type),
+                          business_date = COALESCE(raw.inbound_files.business_date, EXCLUDED.business_date)
+                    RETURNING id
+                    """,
+                    (sender, subject, message_id, filename, content_type, blob, sha256, report_type, business_date),
+                )
+                row = cur.fetchone()
+                new_id = row[0] if row else None
+
+        app.logger.info(
+            "Stored: id=%s filename=%s bytes=%s sha256=%s report_type=%s business_date=%s",
+            new_id,
+            filename,
+            len(blob),
+            sha256,
+            report_type,
+            business_date,
         )
 
-        # If we’re running locally without DATABASE_URL, fail clearly.
-        if not os.getenv("DATABASE_URL"):
-            return jsonify({"ok": False, "error": "DATABASE_URL not set (expected on Railway)"}), 500
+        stored.append(
+            {
+                "id": new_id,
+                "filename": filename,
+                "bytes": len(blob),
+                "sha256": sha256,
+                "report_type": report_type,
+                "business_date": str(business_date) if business_date else None,
+            }
+        )
 
-        stored = 0
-        deduped = 0
-        results = []
-
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                for key in request.files:
-                    f = request.files.get(key)
-                    if not f:
-                        continue
-
-                    filename = f.filename or "unknown"
-                    content_type = f.content_type or "application/octet-stream"
-                    file_bytes = f.read()
-
-                    if not file_bytes or len(file_bytes) < 100:
-                        logger.warning("Skipping tiny/empty file: key=%s filename=%s bytes=%s",
-                                       key, filename, len(file_bytes) if file_bytes else 0)
-                        continue
-
-                    sha256 = hashlib.sha256(file_bytes).hexdigest()
-
-                    payload = {
-                        "received_at": datetime.now(timezone.utc),
-                        "mail_from": mail_from,
-                        "mail_subject": subject,
-                        "mail_message_id": message_id,
-                        "filename": filename,
-                        "content_type": content_type,
-                        "file_bytes": file_bytes,
-                        "sha256": sha256,
-                    }
-
-                    cur.execute(INSERT_SQL, payload)
-                    row = cur.fetchone()
-                    if row and row[0] is not None:
-                        stored += 1
-                        results.append({"key": key, "filename": filename, "bytes": len(file_bytes), "sha256": sha256, "id": row[0]})
-                        logger.info("Stored: id=%s filename=%s bytes=%s sha256=%s", row[0], filename, len(file_bytes), sha256)
-                    else:
-                        deduped += 1
-                        results.append({"key": key, "filename": filename, "bytes": len(file_bytes), "sha256": sha256, "deduped": True})
-                        logger.info("Deduped: filename=%s sha256=%s", filename, sha256)
-
-        return jsonify({"ok": True, "stored": stored, "deduped": deduped, "files": results}), 200
-
-    return app
-
-app = create_app()
-
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
+    return jsonify({"ok": True, "stored": stored})
