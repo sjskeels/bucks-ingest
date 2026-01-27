@@ -1,0 +1,66 @@
+name: Buck's Parse SalesStat (3AM + Noon Chicago)
+
+on:
+  schedule:
+    # Run hourly; gate inside to 03:00 and 12:00 America/Chicago (DST-safe)
+    - cron: "0 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  parse-salesstat:
+    runs-on: ubuntu-latest
+    env:
+      PARSE_URL: ${{ secrets.PARSE_URL }}
+      PARSE_TOKEN: ${{ secrets.PARSE_TOKEN }}
+
+    steps:
+      - name: Validate secrets present
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${PARSE_URL:-}" ]]; then echo "Missing secret: PARSE_URL" >&2; exit 1; fi
+          if [[ -z "${PARSE_TOKEN:-}" ]]; then echo "Missing secret: PARSE_TOKEN" >&2; exit 1; fi
+
+      - name: Gate to 3AM + Noon America/Chicago (DST-safe)
+        id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          HOUR="$(TZ=America/Chicago date +%H)"
+          echo "Local hour (America/Chicago): $HOUR"
+          if [[ "$HOUR" == "03" || "$HOUR" == "12" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Parse latest SalesStat
+        if: steps.gate.outputs.run == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RESP="$(curl -sS -X POST \
+            -H "X-Parse-Token: ${PARSE_TOKEN}" \
+            "${PARSE_URL}/parse/salesstat/latest")"
+
+          echo "Raw response:"
+          echo "$RESP"
+
+          python - <<PY
+          import json, sys
+          resp = """$RESP"""
+          try:
+            data = json.loads(resp)
+          except Exception as e:
+            print("ERROR: Response is not valid JSON:", e, file=sys.stderr)
+            sys.exit(2)
+
+          if data.get("ok") is True:
+            print("OK: Parse succeeded.")
+            sys.exit(0)
+
+          print("ERROR: Parse returned ok=false", file=sys.stderr)
+          print(json.dumps(data, indent=2), file=sys.stderr)
+          sys.exit(1)
+          PY
