@@ -11,7 +11,6 @@ from pypdf import PdfReader
 
 app = Flask(__name__)
 
-
 # --- Report metadata extraction (MVP) ---
 # Goal: populate report_type + business_date WITHOUT parsing PDF contents.
 # We infer from filename and/or email subject.
@@ -41,7 +40,7 @@ def infer_business_date(filename: str | None, subject: str | None) -> date | Non
     Try to infer business date from common patterns.
     Example filename: salesstatreport012526020108.PDF -> MMDDYY = 01/25/26
     """
-    fn = (filename or "")
+    fn = filename or ""
 
     m = re.search(r"(salesstatreport|salesclass)(\d{6})", fn, flags=re.IGNORECASE)
     if m:
@@ -51,7 +50,8 @@ def infer_business_date(filename: str | None, subject: str | None) -> date | Non
         except ValueError:
             pass
 
-    sub = (subject or "")
+    sub = subject or ""
+
     m = re.search(r"(\d{4}-\d{2}-\d{2})", sub)
     if m:
         try:
@@ -156,7 +156,6 @@ def extract_salesstat_kpis(pdf_bytes: bytes) -> dict:
     sales_subtotal = find_money(["sales subtotal"])
     total_sales_and_tax = find_money(["total sales and tax"])
     avg_invoice_amount = find_money(["average invoice amount"])
-
     invoices = find_int(["number of invoices", "daily invoices"])
 
     # If nothing found, throw a helpful error sample
@@ -226,7 +225,17 @@ def mailgun_inbound():
                           business_date = COALESCE(raw.inbound_files.business_date, EXCLUDED.business_date)
                     RETURNING id
                     """,
-                    (sender, subject, message_id, filename, content_type, blob, sha256, report_type, business_date),
+                    (
+                        sender,
+                        subject,
+                        message_id,
+                        filename,
+                        content_type,
+                        blob,
+                        sha256,
+                        report_type,
+                        business_date,
+                    ),
                 )
                 row = cur.fetchone()
                 new_id = row[0] if row else None
@@ -255,6 +264,32 @@ def mailgun_inbound():
     return jsonify({"ok": True, "stored": stored})
 
 
+def _upsert_salesstat_daily(cur, biz_date: date, kpis: dict):
+    cur.execute(
+        """
+        insert into analytics.salesstat_daily
+          (business_date, net_sales, gross_sales, transactions, avg_ticket, updated_at)
+        values
+          (%s, %s, %s, %s, %s, now())
+        on conflict (business_date) do update
+          set net_sales = excluded.net_sales,
+              gross_sales = excluded.gross_sales,
+              transactions = excluded.transactions,
+              avg_ticket = excluded.avg_ticket,
+              updated_at = now()
+        returning business_date, net_sales, gross_sales, transactions, avg_ticket, updated_at
+        """,
+        (
+            biz_date,
+            Decimal(kpis["net_sales"]) if kpis["net_sales"] is not None else None,
+            Decimal(kpis["gross_sales"]) if kpis["gross_sales"] is not None else None,
+            kpis["transactions"],
+            Decimal(kpis["avg_ticket"]) if kpis["avg_ticket"] is not None else None,
+        ),
+    )
+    return cur.fetchone()
+
+
 @app.post("/parse/salesstat/latest")
 def parse_salesstat_latest():
     try:
@@ -280,41 +315,21 @@ def parse_salesstat_latest():
 
                 file_id, biz_date, filename, sha256, pdf_bytes = row
                 if not biz_date:
-                    return jsonify(
-                        {
-                            "ok": False,
-                            "error": "Latest salesstat PDF missing business_date; cannot parse into daily table",
-                            "id": file_id,
-                        }
-                    ), 400
+                    return (
+                        jsonify(
+                            {
+                                "ok": False,
+                                "error": "Latest salesstat PDF missing business_date; cannot parse into daily table",
+                                "id": file_id,
+                            }
+                        ),
+                        400,
+                    )
 
                 kpis = extract_salesstat_kpis(pdf_bytes)
+                out = _upsert_salesstat_daily(cur, biz_date, kpis)
 
-                cur.execute(
-                    """
-                    insert into analytics.salesstat_daily
-                      (business_date, net_sales, gross_sales, transactions, avg_ticket, updated_at)
-                    values
-                      (%s, %s, %s, %s, %s, now())
-                    on conflict (business_date) do update
-                      set net_sales = excluded.net_sales,
-                          gross_sales = excluded.gross_sales,
-                          transactions = excluded.transactions,
-                          avg_ticket = excluded.avg_ticket,
-                          updated_at = now()
-                    returning business_date, net_sales, gross_sales, transactions, avg_ticket, updated_at
-                    """,
-                    (
-                        biz_date,
-                        Decimal(kpis["net_sales"]) if kpis["net_sales"] is not None else None,
-                        Decimal(kpis["gross_sales"]) if kpis["gross_sales"] is not None else None,
-                        kpis["transactions"],
-                        Decimal(kpis["avg_ticket"]) if kpis["avg_ticket"] is not None else None,
-                    ),
-                )
-                out = cur.fetchone()
-
-        app.logger.info("Parsed salesstat: id=%s sha256=%s business_date=%s kpis=%s", file_id, sha256, biz_date, kpis)
+        app.logger.info("Parsed salesstat latest: id=%s sha256=%s business_date=%s", file_id, sha256, biz_date)
 
         return jsonify(
             {
@@ -333,6 +348,69 @@ def parse_salesstat_latest():
 
     except Exception as e:
         app.logger.exception("parse_salesstat_latest failed")
+        return jsonify({"ok": False, "error_type": type(e).__name__, "error": str(e)}), 500
+
+
+@app.post("/parse/salesstat/by-date")
+def parse_salesstat_by_date():
+    try:
+        require_parse_token()
+    except PermissionError as e:
+        return jsonify({"ok": False, "error": str(e)}), 401
+
+    business_date_str = (request.args.get("business_date") or "").strip()
+    if not business_date_str:
+        return jsonify({"ok": False, "error": "missing business_date (YYYY-MM-DD)"}), 400
+
+    try:
+        target_date = datetime.strptime(business_date_str, "%Y-%m-%d").date()
+    except ValueError:
+        return jsonify({"ok": False, "error": "invalid business_date (expected YYYY-MM-DD)"}), 400
+
+    try:
+        with connect(get_db_url()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    select id, business_date, filename, sha256, file_bytes
+                    from raw.inbound_files
+                    where report_type = 'salesstat'
+                      and business_date = %s
+                    order by received_at desc
+                    limit 1
+                    """,
+                    (target_date,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"ok": False, "error": f"No salesstat PDF found for {business_date_str}"}), 404
+
+                file_id, biz_date, filename, sha256, pdf_bytes = row
+                if not biz_date:
+                    return jsonify({"ok": False, "error": f"salesstat PDF missing business_date for {business_date_str}"}), 400
+
+                kpis = extract_salesstat_kpis(pdf_bytes)
+                out = _upsert_salesstat_daily(cur, biz_date, kpis)
+
+        app.logger.info("Parsed salesstat by-date: id=%s sha256=%s business_date=%s", file_id, sha256, biz_date)
+
+        return jsonify(
+            {
+                "ok": True,
+                "source": {"id": file_id, "filename": filename, "sha256": sha256, "business_date": str(biz_date)},
+                "upserted": {
+                    "business_date": str(out[0]),
+                    "net_sales": str(out[1]) if out[1] is not None else None,
+                    "gross_sales": str(out[2]) if out[2] is not None else None,
+                    "transactions": out[3],
+                    "avg_ticket": str(out[4]) if out[4] is not None else None,
+                    "updated_at": out[5].isoformat() if out[5] is not None else None,
+                },
+            }
+        )
+
+    except Exception as e:
+        app.logger.exception("parse_salesstat_by_date failed")
         return jsonify({"ok": False, "error_type": type(e).__name__, "error": str(e)}), 500
 
 
