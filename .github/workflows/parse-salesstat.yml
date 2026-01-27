@@ -2,9 +2,13 @@ name: Buck's Parse SalesStat (3AM + Noon Chicago)
 
 on:
   schedule:
-    # Run hourly; gate inside to 03:00 and 12:00 America/Chicago (DST-safe)
-    - cron: "0 * * * *"
-  workflow_dispatch: {}
+    - cron: "0 * * * *"   # hourly; job gates itself to 03:00 and 12:00 America/Chicago
+  workflow_dispatch:
+    inputs:
+      business_date:
+        description: "Optional backfill date (YYYY-MM-DD). If set, calls /parse/salesstat/by-date"
+        required: false
+        default: ""
 
 jobs:
   parse-salesstat:
@@ -12,6 +16,7 @@ jobs:
     env:
       PARSE_URL: ${{ secrets.PARSE_URL }}
       PARSE_TOKEN: ${{ secrets.PARSE_TOKEN }}
+      BUSINESS_DATE: ${{ github.event.inputs.business_date }}
 
     steps:
       - name: Validate secrets present
@@ -21,37 +26,51 @@ jobs:
           if [[ -z "${PARSE_URL:-}" ]]; then echo "Missing secret: PARSE_URL" >&2; exit 1; fi
           if [[ -z "${PARSE_TOKEN:-}" ]]; then echo "Missing secret: PARSE_TOKEN" >&2; exit 1; fi
 
-      - name: Gate to 3AM + Noon America/Chicago (DST-safe)
-        id: gate
+      - name: Decide endpoint (latest vs by-date)
+        id: decide
         shell: bash
         run: |
           set -euo pipefail
 
-          # Manual runs should always execute
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            echo "Manual run → run=true"
-            echo "run=true" >> "$GITHUB_OUTPUT"
+          # Manual backfill if BUSINESS_DATE provided
+          if [[ -n "${BUSINESS_DATE:-}" ]]; then
+            echo "mode=by-date" >> "$GITHUB_OUTPUT"
+            echo "url=${PARSE_URL}/parse/salesstat/by-date?business_date=${BUSINESS_DATE}" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
+          # Manual run without a date -> run latest immediately
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            echo "mode=latest" >> "$GITHUB_OUTPUT"
+            echo "url=${PARSE_URL}/parse/salesstat/latest" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Scheduled run -> gate to 03:00 and 12:00 America/Chicago (DST-safe)
           HOUR="$(TZ=America/Chicago date +%H)"
           echo "Local hour (America/Chicago): $HOUR"
           if [[ "$HOUR" == "03" || "$HOUR" == "12" ]]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "mode=latest" >> "$GITHUB_OUTPUT"
+            echo "url=${PARSE_URL}/parse/salesstat/latest" >> "$GITHUB_OUTPUT"
           else
-            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "mode=skip" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Skip (not scheduled hour)
+        if: steps.decide.outputs.mode == 'skip'
+        run: echo "Not 03:00 or 12:00 America/Chicago. Skipping."
 
-      - name: Parse latest SalesStat
-        if: steps.gate.outputs.run == 'true'
+      - name: Call parse endpoint
+        if: steps.decide.outputs.mode != 'skip'
         shell: bash
         run: |
           set -euo pipefail
+          echo "Mode: ${{ steps.decide.outputs.mode }}"
+          echo "URL:  ${{ steps.decide.outputs.url }}"
 
           RESP="$(curl -sS -X POST \
             -H "X-Parse-Token: ${PARSE_TOKEN}" \
-            "${PARSE_URL}/parse/salesstat/latest")"
+            "${{ steps.decide.outputs.url }}")"
 
           echo "Raw response:"
           echo "$RESP"
