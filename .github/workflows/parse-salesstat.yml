@@ -1,4 +1,4 @@
-name: Buck's Parse SalesStat (3AM + Noon Chicago)
+﻿name: Buck's Parse SalesStat (3AM + Noon Chicago)
 
 on:
   schedule:
