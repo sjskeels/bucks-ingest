@@ -13,12 +13,13 @@ app = Flask(__name__)
 
 # --- Report metadata extraction (MVP) ---
 # Goal: populate report_type + business_date WITHOUT parsing PDF contents.
-# We infer from filename and/or email subject.
 
 _REPORT_PREFIX_MAP = {
     "salesstatreport": "salesstat",
     "salesclassreport": "salesclass",
     "salesclass": "salesclass",
+    # Daily Invoice List (Payment Type source)
+    "arinvregreport": "paytype",
 }
 
 
@@ -32,6 +33,8 @@ def infer_report_type(filename: str | None, subject: str | None) -> str | None:
 
     if "daily sales statistics" in sub:
         return "salesstat"
+    if "daily invoice list" in sub or "invoice list" in sub:
+        return "paytype"
 
     return None
 
@@ -39,13 +42,18 @@ def infer_report_type(filename: str | None, subject: str | None) -> str | None:
 def infer_business_date(filename: str | None, subject: str | None) -> date | None:
     """
     Try to infer business date from common patterns.
-    Example filenames:
+    Examples:
       salesstatreport012526020108.PDF  -> MMDDYY=012526 -> 2026-01-25
       salesclassreport012726010024.PDF -> MMDDYY=012726 -> 2026-01-27
+      arinvregreport012726010235.PDF   -> MMDDYY=012726 -> 2026-01-27
     """
     fn = filename or ""
 
-    m = re.search(r"(salesstatreport|salesclassreport)(\d{6})", fn, flags=re.IGNORECASE)
+    m = re.search(
+        r"(salesstatreport|salesclassreport|arinvregreport)(\d{6})",
+        fn,
+        flags=re.IGNORECASE,
+    )
     if m:
         mmddyy = m.group(2)
         try:
@@ -117,24 +125,9 @@ def _money_to_decimal(s: str) -> Decimal | None:
 # SalesStat extractor
 # -----------------------
 def extract_salesstat_kpis(pdf_bytes: bytes) -> dict:
-    """
-    TransAct "Sales Statistics Report" extractor (MVP).
-
-    Map TransAct labels -> our analytics columns:
-      net_sales    <- "Sales SubTotal"
-      gross_sales  <- "Total Sales and Tax"
-      transactions <- "Number of Invoices" (or "Daily Invoices")
-      avg_ticket   <- "Average Invoice Amount"
-    """
     reader = PdfReader(BytesIO(pdf_bytes))
+    text = "\n".join([(p.extract_text() or "") for p in reader.pages])
 
-    text_parts = []
-    for p in reader.pages:
-        t = p.extract_text() or ""
-        text_parts.append(t)
-    text = "\n".join(text_parts)
-
-    # Normalize lines
     lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines()]
     lines = [ln for ln in lines if ln]
 
@@ -162,10 +155,8 @@ def extract_salesstat_kpis(pdf_bytes: bytes) -> dict:
     sales_subtotal = find_money(["sales subtotal"])
     total_sales_and_tax = find_money(["total sales and tax"])
     avg_invoice_amount = find_money(["average invoice amount"])
-
     invoices = find_int(["number of invoices", "daily invoices"])
 
-    # If nothing found, throw a helpful error sample
     if (
         sales_subtotal is None
         and total_sales_and_tax is None
@@ -216,12 +207,6 @@ _salesclass_num_re = re.compile(r"-?\d[\d,]*\.\d{2}%?")
 
 
 def extract_salesclass_rows(pdf_bytes: bytes) -> list[dict]:
-    """
-    TransAct "Sales by Class Summary Report" extractor.
-
-    Columns we store (per class_code):
-      ext_price, ext_cost, profit, gp_pct, ext_tax, price_plus_tax, pct_total, class_name
-    """
     reader = PdfReader(BytesIO(pdf_bytes))
     text = "\n".join([(p.extract_text() or "") for p in reader.pages])
 
@@ -243,8 +228,6 @@ def extract_salesclass_rows(pdf_bytes: bytes) -> list[dict]:
             continue
 
         class_code = parts[0]
-
-        # Skip lines where the "class_code" is actually a money value
         if re.match(r"^\d[\d,]*\.\d{2}$", class_code):
             continue
 
@@ -252,14 +235,12 @@ def extract_salesclass_rows(pdf_bytes: bytes) -> list[dict]:
         if len(matches) < 5:
             continue
 
-        # First five numeric tokens
         ext_price = matches[0].group()
         ext_cost = matches[1].group()
         profit = matches[2].group()
         gp_pct = matches[3].group().replace("%", "")
         ext_tax = matches[4].group()
 
-        # Remaining numeric tokens (typically: repeated ext_price, price_plus_tax, pct_total)
         post = [m.group() for m in matches[5:]]
         price_plus_tax = post[-2] if len(post) >= 2 else None
         pct_total = post[-1] if len(post) >= 1 else None
@@ -336,6 +317,132 @@ def _upsert_salesclass_rows(cur, biz_date: date, source_file_id: int, source_sha
 
 
 # -----------------------
+# PayType extractor (Daily Invoice List)
+# -----------------------
+def extract_paytype_rows(pdf_bytes: bytes) -> list[dict]:
+    """
+    Attempts to extract payment type totals from the Daily Invoice List PDF.
+
+    Heuristic:
+      - Find a "tender/payment summary" section if present
+      - Parse lines of the form: <name> <count> <amount>
+        where <amount> is the last money token on the line.
+    """
+    reader = PdfReader(BytesIO(pdf_bytes))
+    text = "\n".join([(p.extract_text() or "") for p in reader.pages])
+
+    lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines()]
+    lines = [ln for ln in lines if ln]
+
+    # Try to narrow to a tender/payment section (if found)
+    start = None
+    for i, ln in enumerate(lines):
+        ll = ln.lower()
+        if ("tender" in ll or "payment" in ll) and ("summary" in ll or "totals" in ll or "type" in ll):
+            start = i
+            break
+
+    end = None
+    if start is not None:
+        for j in range(start + 1, len(lines)):
+            ll = lines[j].lower()
+            if "report totals" in ll or "grand total" in ll:
+                end = j
+                break
+
+    candidates = lines[(start + 1 if start is not None else 0) : (end if end is not None else len(lines))]
+
+    agg: dict[str, dict] = {}
+
+    for ln in candidates:
+        ll = ln.lower()
+
+        # Skip obvious headers
+        if any(h in ll for h in ["printed:", "page ", "invoice", "register", "report"]):
+            continue
+        if any(h in ll for h in ["tender", "payment", "type", "count", "amount", "total"]) and not _money_re.search(ln):
+            continue
+
+        monies = _money_re.findall(ln)
+        if not monies:
+            continue
+
+        amt = _money_to_decimal(monies[-1])
+        if amt is None:
+            continue
+
+        # Everything before the last money token
+        cut = ln.rfind(monies[-1])
+        left = ln[:cut].strip()
+        if not left:
+            continue
+
+        ints = _int_re.findall(left)
+        if not ints:
+            continue
+
+        # last int on the left side is the count
+        try:
+            cnt = int(ints[-1].replace(",", ""))
+        except Exception:
+            continue
+
+        # name is left side up to last int token
+        cut2 = left.rfind(ints[-1])
+        name = left[:cut2].strip().rstrip(":")
+        name = re.sub(r"\s{2,}", " ", name)
+
+        if not name or re.match(r"^\d", name):
+            continue
+
+        # avoid total lines
+        if any(bad in name.lower() for bad in ["total", "totals", "subtotal"]):
+            continue
+
+        rec = agg.get(name)
+        if not rec:
+            agg[name] = {"payment_type": name, "txn_count": cnt, "amount": amt}
+        else:
+            rec["txn_count"] += cnt
+            rec["amount"] += amt
+
+    if not agg:
+        sample = "\n".join(lines[:140])
+        raise ValueError(f"Could not extract any payment type rows. Sample:\n{sample}")
+
+    return list(agg.values())
+
+
+def _upsert_paytype_rows(cur, biz_date: date, source_file_id: int, source_sha256: str, rows: list[dict]) -> int:
+    n = 0
+    for r in rows:
+        cur.execute(
+            """
+            insert into analytics.paytype_daily
+              (business_date, payment_type, amount, txn_count, source_file_id, source_sha256, updated_at)
+            values
+              (%s, %s, %s, %s, %s, %s, now())
+            on conflict (business_date, payment_type) do update
+              set amount = excluded.amount,
+                  txn_count = excluded.txn_count,
+                  source_file_id = excluded.source_file_id,
+                  source_sha256 = excluded.source_sha256,
+                  updated_at = now()
+            """,
+            (
+                biz_date,
+                r["payment_type"],
+                Decimal(r["amount"]) if r.get("amount") is not None else None,
+                int(r["txn_count"]) if r.get("txn_count") is not None else None,
+                source_file_id,
+                source_sha256,
+            ),
+        )
+        n += 1
+    return n
+
+
+# -----------------------
 # Flask routes
 # -----------------------
 @app.get("/health")
@@ -391,16 +498,6 @@ def mailgun_inbound():
                 )
                 row = cur.fetchone()
                 new_id = row[0] if row else None
-
-        app.logger.info(
-            "Stored: id=%s filename=%s bytes=%s sha256=%s report_type=%s business_date=%s",
-            new_id,
-            filename,
-            len(blob),
-            sha256,
-            report_type,
-            business_date,
-        )
 
         stored.append(
             {
@@ -465,7 +562,6 @@ def parse_salesstat_latest():
                 },
             }
         )
-
     except Exception as e:
         app.logger.exception("parse_salesstat_latest failed")
         return jsonify({"ok": False, "error_type": type(e).__name__, "error": str(e)}), 500
@@ -526,7 +622,6 @@ def parse_salesstat_by_date():
                 },
             }
         )
-
     except Exception as e:
         app.logger.exception("parse_salesstat_by_date failed")
         return jsonify({"ok": False, "error_type": type(e).__name__, "error": str(e)}), 500
@@ -574,7 +669,6 @@ def parse_salesclass_latest():
                 "rows_upserted": n,
             }
         )
-
     except Exception as e:
         app.logger.exception("parse_salesclass_latest failed")
         return jsonify({"ok": False, "error_type": type(e).__name__, "error": str(e)}), 500
@@ -596,7 +690,6 @@ def parse_salesclass_by_date():
     except ValueError:
         return jsonify({"ok": False, "error": "invalid business_date (expected YYYY-MM-DD)"}), 400
 
-    # Also match old rows that may have business_date NULL but filename contains MMDDYY
     mmddyy = target_date.strftime("%m%d%y")
 
     try:
@@ -635,9 +728,123 @@ def parse_salesclass_by_date():
                 "rows_upserted": n,
             }
         )
-
     except Exception as e:
         app.logger.exception("parse_salesclass_by_date failed")
+        return jsonify({"ok": False, "error_type": type(e).__name__, "error": str(e)}), 500
+
+
+# --- PayType endpoints ---
+@app.post("/parse/paytype/latest")
+def parse_paytype_latest():
+    try:
+        require_parse_token()
+    except PermissionError as e:
+        return jsonify({"ok": False, "error": str(e)}), 401
+
+    try:
+        with connect(get_db_url()) as conn:
+            with conn.cursor() as cur:
+                # Also match the prefix even if report_type wasn't inferred on older rows
+                cur.execute(
+                    """
+                    select id, report_type, business_date, filename, mail_subject, sha256, file_bytes
+                    from raw.inbound_files
+                    where (report_type = 'paytype' or filename ilike 'arinvregreport%')
+                    order by received_at desc
+                    limit 1
+                    """
+                )
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"ok": False, "error": "No paytype (arinvregreport) PDFs found in raw.inbound_files"}), 404
+
+                file_id, rtype, biz_date, filename, mail_subject, sha256, pdf_bytes = row
+
+                if not rtype:
+                    cur.execute("update raw.inbound_files set report_type='paytype' where id=%s", (file_id,))
+
+                if not biz_date:
+                    biz_date = infer_business_date(filename, mail_subject)
+                    if biz_date:
+                        cur.execute("update raw.inbound_files set business_date=%s where id=%s", (biz_date, file_id))
+                    else:
+                        return jsonify({"ok": False, "error": "Latest paytype PDF missing business_date"}), 400
+
+                rows = extract_paytype_rows(pdf_bytes)
+                n = _upsert_paytype_rows(cur, biz_date, file_id, sha256, rows)
+
+        return jsonify(
+            {
+                "ok": True,
+                "source": {"id": file_id, "filename": filename, "sha256": sha256, "business_date": str(biz_date)},
+                "rows_upserted": n,
+            }
+        )
+    except Exception as e:
+        app.logger.exception("parse_paytype_latest failed")
+        return jsonify({"ok": False, "error_type": type(e).__name__, "error": str(e)}), 500
+
+
+@app.post("/parse/paytype/by-date")
+def parse_paytype_by_date():
+    try:
+        require_parse_token()
+    except PermissionError as e:
+        return jsonify({"ok": False, "error": str(e)}), 401
+
+    business_date_str = (request.args.get("business_date") or "").strip()
+    if not business_date_str:
+        return jsonify({"ok": False, "error": "missing business_date (YYYY-MM-DD)"}), 400
+
+    try:
+        target_date = datetime.strptime(business_date_str, "%Y-%m-%d").date()
+    except ValueError:
+        return jsonify({"ok": False, "error": "invalid business_date (expected YYYY-MM-DD)"}), 400
+
+    mmddyy = target_date.strftime("%m%d%y")
+
+    try:
+        with connect(get_db_url()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    select id, report_type, business_date, filename, mail_subject, sha256, file_bytes
+                    from raw.inbound_files
+                    where (report_type='paytype' and business_date=%s)
+                       or (filename ilike 'arinvregreport%' and (
+                             business_date=%s
+                             or (business_date is null and filename ilike %s)
+                          ))
+                    order by received_at desc
+                    limit 1
+                    """,
+                    (target_date, target_date, f"%{mmddyy}%"),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"ok": False, "error": f"No paytype PDF found for {business_date_str}"}), 404
+
+                file_id, rtype, biz_date, filename, mail_subject, sha256, pdf_bytes = row
+
+                if not rtype:
+                    cur.execute("update raw.inbound_files set report_type='paytype' where id=%s", (file_id,))
+
+                if not biz_date:
+                    biz_date = infer_business_date(filename, mail_subject) or target_date
+                    cur.execute("update raw.inbound_files set business_date=%s where id=%s", (biz_date, file_id))
+
+                rows = extract_paytype_rows(pdf_bytes)
+                n = _upsert_paytype_rows(cur, biz_date, file_id, sha256, rows)
+
+        return jsonify(
+            {
+                "ok": True,
+                "source": {"id": file_id, "filename": filename, "sha256": sha256, "business_date": str(biz_date)},
+                "rows_upserted": n,
+            }
+        )
+    except Exception as e:
+        app.logger.exception("parse_paytype_by_date failed")
         return jsonify({"ok": False, "error_type": type(e).__name__, "error": str(e)}), 500
 
 
