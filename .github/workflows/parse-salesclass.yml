@@ -1,0 +1,94 @@
+﻿name: Buck's Parse SalesClass (3AM + Noon Chicago)
+
+on:
+  schedule:
+    - cron: "0 * * * *"   # hourly; job gates itself to 03:00 and 12:00 America/Chicago
+  workflow_dispatch:
+    inputs:
+      business_date:
+        description: "Optional backfill date (YYYY-MM-DD). If set, calls /parse/salesclass/by-date"
+        required: false
+        default: ""
+
+jobs:
+  parse-salesclass:
+    runs-on: ubuntu-latest
+    env:
+      PARSE_URL: ${{ secrets.PARSE_URL }}
+      PARSE_TOKEN: ${{ secrets.PARSE_TOKEN }}
+      BUSINESS_DATE: ${{ github.event.inputs.business_date }}
+
+    steps:
+      - name: Validate secrets present
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${PARSE_URL:-}" ]]; then echo "Missing secret: PARSE_URL" >&2; exit 1; fi
+          if [[ -z "${PARSE_TOKEN:-}" ]]; then echo "Missing secret: PARSE_TOKEN" >&2; exit 1; fi
+
+      - name: Decide endpoint (latest vs by-date)
+        id: decide
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Manual backfill if BUSINESS_DATE provided
+          if [[ -n "${BUSINESS_DATE:-}" ]]; then
+            echo "mode=by-date" >> "$GITHUB_OUTPUT"
+            echo "url=${PARSE_URL}/parse/salesclass/by-date?business_date=${BUSINESS_DATE}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Manual run without a date -> run latest immediately
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            echo "mode=latest" >> "$GITHUB_OUTPUT"
+            echo "url=${PARSE_URL}/parse/salesclass/latest" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Scheduled run -> gate to 03:00 and 12:00 America/Chicago (DST-safe)
+          HOUR="$(TZ=America/Chicago date +%H)"
+          echo "Local hour (America/Chicago): $HOUR"
+          if [[ "$HOUR" == "03" || "$HOUR" == "12" ]]; then
+            echo "mode=latest" >> "$GITHUB_OUTPUT"
+            echo "url=${PARSE_URL}/parse/salesclass/latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=skip" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip (not scheduled hour)
+        if: steps.decide.outputs.mode == 'skip'
+        run: echo "Not 03:00 or 12:00 America/Chicago. Skipping."
+
+      - name: Call parse endpoint
+        if: steps.decide.outputs.mode != 'skip'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Mode: ${{ steps.decide.outputs.mode }}"
+          echo "URL:  ${{ steps.decide.outputs.url }}"
+
+          RESP="$(curl -sS -X POST \
+            -H "X-Parse-Token: ${PARSE_TOKEN}" \
+            "${{ steps.decide.outputs.url }}")"
+
+          echo "Raw response:"
+          echo "$RESP"
+
+          python - <<PY
+          import json, sys
+          resp = """$RESP"""
+          try:
+            data = json.loads(resp)
+          except Exception as e:
+            print("ERROR: Response is not valid JSON:", e, file=sys.stderr)
+            sys.exit(2)
+
+          if data.get("ok") is True:
+            print("OK: Parse succeeded.")
+            sys.exit(0)
+
+          print("ERROR: Parse returned ok=false", file=sys.stderr)
+          print(json.dumps(data, indent=2), file=sys.stderr)
+          sys.exit(1)
+          PY
