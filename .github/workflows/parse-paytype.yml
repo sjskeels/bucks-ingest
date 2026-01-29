@@ -1,0 +1,66 @@
+﻿name: Buck's Parse PayType (3AM + Noon Chicago)
+
+on:
+  schedule:
+    # Runs hourly; we "gate" execution to 3AM + Noon America/Chicago (DST-safe)
+    - cron: "7 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "latest or by-date"
+        required: true
+        default: "latest"
+      business_date:
+        description: "YYYY-MM-DD (required for by-date)"
+        required: false
+
+jobs:
+  parse-paytype:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate secrets present
+        run: |
+          set -euo pipefail
+          : "${{ secrets.PARSE_URL }}"
+          : "${{ secrets.PARSE_TOKEN }}"
+
+      - name: Gate to 3AM + Noon America/Chicago (DST-safe)
+        if: ${{ github.event_name == 'schedule' }}
+        run: |
+          set -euo pipefail
+          HOUR=$(TZ=America/Chicago date +%H)
+          echo "Local hour (America/Chicago): $HOUR"
+          if [ "$HOUR" != "03" ] && [ "$HOUR" != "12" ]; then
+            echo "Not a run window. Exiting."
+            exit 0
+          fi
+
+      - name: Parse PayType
+        env:
+          PARSE_URL: ${{ secrets.PARSE_URL }}
+          PARSE_TOKEN: ${{ secrets.PARSE_TOKEN }}
+          MODE: ${{ github.event.inputs.mode }}
+          BUSINESS_DATE: ${{ github.event.inputs.business_date }}
+        run: |
+          set -euo pipefail
+          MODE="${MODE:-latest}"
+          BUSINESS_DATE="${BUSINESS_DATE:-}"
+
+          echo "Mode: ${MODE}"
+
+          if [ "${MODE}" = "by-date" ]; then
+            if [ -z "${BUSINESS_DATE}" ]; then
+              echo "Missing business_date for by-date mode"
+              exit 1
+            fi
+            URL="${PARSE_URL}/parse/paytype/by-date?business_date=${BUSINESS_DATE}"
+          else
+            URL="${PARSE_URL}/parse/paytype/latest"
+          fi
+
+          echo "URL: ${URL}"
+          RESP="$(curl -sS -X POST -H "X-Parse-Token: ${PARSE_TOKEN}" "${URL}")"
+          echo "Raw response:"
+          echo "${RESP}"
+          echo "${RESP}" | grep -q '"ok":true' || (echo "ERROR: Parse failed" && exit 1)
+          echo "OK: Parse succeeded."
