@@ -11,18 +11,15 @@ from pypdf import PdfReader
 
 app = Flask(__name__)
 
-# --- Report metadata extraction (MVP) ---
-# Goal: populate report_type + business_date WITHOUT parsing PDF contents.
-# We infer from filename and/or email subject.
+# -----------------------------------------------------------------------------
+# Report metadata inference (MVP)
+# -----------------------------------------------------------------------------
 
 _REPORT_PREFIX_MAP = {
     "salesstatreport": "salesstat",
     "salesclassreport": "salesclass",
-    "salesclass": "salesclass",
-    # Invoice List Summary (payment type subtotals live here)
     "arinvregreport": "paytype",
 }
-
 
 def infer_report_type(filename: str | None, subject: str | None) -> str | None:
     fn = (filename or "").lower()
@@ -32,11 +29,12 @@ def infer_report_type(filename: str | None, subject: str | None) -> str | None:
         if fn.startswith(prefix):
             return rtype
 
+    # subject-based fallbacks
     if "daily sales statistics" in sub:
         return "salesstat"
-    if "sales by class" in sub:
+    if "sales by class" in sub or "sales class" in sub:
         return "salesclass"
-    if "invoice list" in sub:
+    if "daily invoice list" in sub or "invoice list summary" in sub:
         return "paytype"
 
     return None
@@ -48,9 +46,9 @@ def infer_business_date(filename: str | None, subject: str | None) -> date | Non
     Examples:
       salesstatreport012526020108.PDF  -> MMDDYY = 01/25/26
       salesclassreport012726010024.PDF -> MMDDYY = 01/27/26
-      arinvregreport012726010235.PDF   -> MMDDYY = 01/27/26
+      arinvregreport012626010200.PDF   -> MMDDYY = 01/26/26
     """
-    fn = filename or ""
+    fn = (filename or "")
 
     m = re.search(r"(salesstatreport|salesclassreport|arinvregreport)(\d{6})", fn, flags=re.IGNORECASE)
     if m:
@@ -60,8 +58,9 @@ def infer_business_date(filename: str | None, subject: str | None) -> date | Non
         except ValueError:
             pass
 
-    sub = subject or ""
+    sub = (subject or "")
 
+    # YYYY-MM-DD
     m = re.search(r"(\d{4}-\d{2}-\d{2})", sub)
     if m:
         try:
@@ -69,6 +68,7 @@ def infer_business_date(filename: str | None, subject: str | None) -> date | Non
         except ValueError:
             pass
 
+    # MM/DD/YYYY
     m = re.search(r"(\d{2}/\d{2}/\d{4})", sub)
     if m:
         try:
@@ -100,9 +100,12 @@ def require_parse_token() -> None:
         raise PermissionError("Missing/invalid X-Parse-Token")
 
 
+# -----------------------------------------------------------------------------
+# Common parsing helpers
+# -----------------------------------------------------------------------------
+
 _money_re = re.compile(r"(\(?-?\$?\d[\d,]*\.\d{2}\)?)")
 _int_re = re.compile(r"(\d[\d,]*)")
-
 
 def _money_to_decimal(s: str) -> Decimal | None:
     if not s:
@@ -120,19 +123,28 @@ def _money_to_decimal(s: str) -> Decimal | None:
         return None
 
 
-def _pdf_text(pdf_bytes: bytes) -> str:
+def _read_pdf_text(pdf_bytes: bytes) -> str:
     reader = PdfReader(BytesIO(pdf_bytes))
-    return "\n".join([(p.extract_text() or "") for p in reader.pages])
+    parts: list[str] = []
+    for p in reader.pages:
+        parts.append(p.extract_text() or "")
+    return "\n".join(parts)
 
 
-def _norm_lines(text: str) -> list[str]:
+def _normalize_lines(text: str) -> list[str]:
     lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines()]
     return [ln for ln in lines if ln]
 
 
-# -----------------------
-# SalesStat extractor
-# -----------------------
+def _fix_concatenated_decimals(s: str) -> str:
+    # Example: "59.4564.431.27" -> "59.45 64.43 1.27"
+    return re.sub(r"(\d\.\d{2})(?=\d)", r"\1 ", s)
+
+
+# -----------------------------------------------------------------------------
+# SalesStat parsing
+# -----------------------------------------------------------------------------
+
 def extract_salesstat_kpis(pdf_bytes: bytes) -> dict:
     """
     TransAct "Sales Statistics Report" extractor (MVP).
@@ -143,8 +155,8 @@ def extract_salesstat_kpis(pdf_bytes: bytes) -> dict:
       transactions <- "Number of Invoices" (or "Daily Invoices")
       avg_ticket   <- "Average Invoice Amount"
     """
-    text = _pdf_text(pdf_bytes)
-    lines = _norm_lines(text)
+    text = _read_pdf_text(pdf_bytes)
+    lines = _normalize_lines(text)
 
     def find_money(label_variants: list[str]) -> Decimal | None:
         for ln in lines:
@@ -172,209 +184,153 @@ def extract_salesstat_kpis(pdf_bytes: bytes) -> dict:
     avg_invoice_amount = find_money(["average invoice amount"])
     invoices = find_int(["number of invoices", "daily invoices"])
 
-    if (
-        sales_subtotal is None
-        and total_sales_and_tax is None
-        and avg_invoice_amount is None
-        and invoices is None
-    ):
+    if sales_subtotal is None and total_sales_and_tax is None and avg_invoice_amount is None and invoices is None:
         sample = "\n".join(lines[:80])
         raise ValueError(f"Could not extract KPIs from PDF text. Sample:\n{sample}")
 
     return {
-        "net_sales": str(sales_subtotal) if sales_subtotal is not None else None,
-        "gross_sales": str(total_sales_and_tax) if total_sales_and_tax is not None else None,
+        "net_sales": sales_subtotal,
+        "gross_sales": total_sales_and_tax,
         "transactions": invoices,
-        "avg_ticket": str(avg_invoice_amount) if avg_invoice_amount is not None else None,
+        "avg_ticket": avg_invoice_amount,
     }
 
 
-# -----------------------
-# SalesClass extractor
-# -----------------------
-_salesclass_num_re = re.compile(r"-?\d[\d,]*\.\d{2}%?")
-
+# -----------------------------------------------------------------------------
+# SalesClass parsing
+# -----------------------------------------------------------------------------
 
 def extract_salesclass_rows(pdf_bytes: bytes) -> list[dict]:
-    reader = PdfReader(BytesIO(pdf_bytes))
-    text = "\n".join([(p.extract_text() or "") for p in reader.pages])
+    """
+    TransAct "Sales by Class" daily report.
 
-    lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines()]
-    lines = [ln for ln in lines if ln]
+    We extract per-class:
+      class_code, class_name, net_sales, cost, gross_profit, margin_pct
+    """
+    text = _read_pdf_text(pdf_bytes)
+    raw_lines = [ln for ln in text.splitlines() if ln.strip()]
+
+    fixed_lines: list[str] = []
+    for ln in raw_lines:
+        ln = re.sub(r"\s+", " ", ln).strip()
+        ln = _fix_concatenated_decimals(ln)
+        ln = re.sub(r"(\d)([A-Za-z])", r"\1 \2", ln)  # "4.98Sporting" -> "4.98 Sporting"
+        ln = re.sub(r"\s+", " ", ln).strip()
+        fixed_lines.append(ln)
+
+    # Example line after fixing:
+    # 05 59.45 29.48 29.96 50.41% 4.98 Sporting Goods 59.45 64.43 1.27
+    pat = re.compile(
+        r"^(?P<class_code>(?:[A-Z0-9]{1,6}|<BLANK>))\s+"
+        r"(?P<net>-?\d[\d,]*\.\d{2})\s+"
+        r"(?P<cost>-?\d[\d,]*\.\d{2})\s+"
+        r"(?P<gp>-?\d[\d,]*\.\d{2})\s+"
+        r"(?P<margin>-?\d[\d,]*\.\d{2})%\s+"
+        r"(?P<tax>-?\d[\d,]*\.\d{2})\s+"
+        r"(?P<name>.+?)\s+"
+        r"(?P<taxable>-?\d[\d,]*\.\d{2})\s+"
+        r"(?P<gross>-?\d[\d,]*\.\d{2})\s+"
+        r"(?P<tax2>-?\d[\d,]*\.\d{2})$",
+        re.IGNORECASE,
+    )
 
     rows: list[dict] = []
-
-    for line in lines:
-        l = re.sub(r"(?<=\d)(?=[A-Za-z<])", " ", line)
-        l = re.sub(r"(?<=%)(?=[A-Za-z])", " ", l)
-        ll = l.lower()
-
-        if "reports totals" in ll or ll.startswith("printed:") or ll.endswith("dssumcls"):
+    for ln in fixed_lines:
+        m = pat.match(ln)
+        if not m:
             continue
-
-        parts = l.split()
-        if not parts:
-            continue
-
-        class_code = parts[0]
-        if re.match(r"^\d[\d,]*\.\d{2}$", class_code):
-            continue
-
-        matches = list(_salesclass_num_re.finditer(l))
-        if len(matches) < 5:
-            continue
-
-        ext_price = matches[0].group()
-        ext_cost = matches[1].group()
-        profit = matches[2].group()
-        gp_pct = matches[3].group().replace("%", "")
-        ext_tax = matches[4].group()
-
-        post = [m.group() for m in matches[5:]]
-        price_plus_tax = post[-2] if len(post) >= 2 else None
-        pct_total = post[-1] if len(post) >= 1 else None
-
-        class_name = None
-        if len(matches) >= 6:
-            class_name = l[matches[4].end() : matches[5].start()].strip()
-            class_name = class_name if class_name else None
-
+        gd = m.groupdict()
         rows.append(
             {
-                "class_code": class_code,
-                "class_name": class_name,
-                "ext_price": ext_price,
-                "ext_cost": ext_cost,
-                "profit": profit,
-                "gp_pct": gp_pct,
-                "ext_tax": ext_tax,
-                "price_plus_tax": price_plus_tax,
-                "pct_total": pct_total,
+                "class_code": gd["class_code"].strip(),
+                "class_name": gd["name"].strip(),
+                "net_sales": _money_to_decimal(gd["net"]),
+                "cost": _money_to_decimal(gd["cost"]),
+                "gross_profit": _money_to_decimal(gd["gp"]),
+                "margin_pct": _money_to_decimal(gd["margin"]),
             }
         )
 
     if not rows:
-        sample = "\n".join(lines[:120])
-        raise ValueError(f"Could not extract any SalesClass rows. Sample:\n{sample}")
+        sample = "\n".join(fixed_lines[:120])
+        raise ValueError(f"Could not extract any salesclass rows. Sample:\n{sample}")
 
     return rows
 
 
-# -----------------------
-# PayType extractor (Invoice List Summary / ARInvRegS)
-# -----------------------
-def extract_paytype_rows(pdf_bytes: bytes) -> list[dict]:
+# -----------------------------------------------------------------------------
+# PayType parsing (Invoice List Summary ordered by Payment Type)
+# -----------------------------------------------------------------------------
+
+def extract_paytype_totals(pdf_bytes: bytes) -> list[dict]:
     """
-    This report DOES NOT have a nice "tender summary table".
-    It has payment-type subtotals in lines like:
+    Extract per payment type totals from the 'Invoice List Summary' report.
 
-      1,107.2550.86Acct ChgPayment Type: 449.10 607.29
+    The report prints subtotal lines like:
+      1,187.9530.19Acct ChgPayment Type: 797.24 360.52
+    Meaning:
+      invoice_total = 1187.95
+      tax_amount    = 30.19
+      payment_type  = "Acct Chg"
+      taxed_sales   = 797.24
+      nontaxed_sales= 360.52
 
-    Interpretation:
-      - First number: total SALES for that payment type (pre-tax)
-      - Second number: total TAX for that payment type
-      - After 'Payment Type:' the order is:
-          Non-Taxed sales FIRST, Taxed sales SECOND  ✅ (confirmed by tax-rate math)
-
-    For now, we store:
-      amount = total SALES (pre-tax)
-      txn_count = NULL (we can add counts later if you want)
+    Sanity check:
+      taxed_sales + nontaxed_sales == invoice_total - tax_amount
     """
-    text = _pdf_text(pdf_bytes)
-    lines = _norm_lines(text)
+    text = _read_pdf_text(pdf_bytes)
+    blob = re.sub(r"\s+", " ", text).strip()
 
-    money_pat = re.compile(r"-?\d[\d,]*\.\d{2}")
+    # Regex that tolerates missing spaces (e.g., "...30.19Acct ChgPayment Type...")
+    pat = re.compile(
+        r"(?P<invoice_total>-?\d[\d,]*\.\d{2})\s*"
+        r"(?P<tax_amount>-?\d[\d,]*\.\d{2})\s*"
+        r"(?P<payment_type>[A-Za-z0-9/ ]{1,20}?)(?=Payment\s*Type:)\s*"
+        r"Payment\s*Type:\s*"
+        r"(?P<taxed_sales>-?\d[\d,]*\.\d{2})\s*"
+        r"(?P<nontaxed_sales>-?\d[\d,]*\.\d{2})",
+        re.IGNORECASE,
+    )
 
-    out: list[dict] = []
+    matches = list(pat.finditer(blob))
+    if not matches:
+        sample = blob[:2000]
+        raise ValueError(f"Could not extract any payment type totals. Sample:\n{sample}")
 
-    i = 0
-    while i < len(lines):
-        ln = lines[i]
+    # last occurrence per payment type wins (avoids accidental partials)
+    out_by_type: dict[str, dict] = {}
 
-        # Case A: one-line subtotal contains 'Payment Type:'
-        if "Payment Type:" in ln:
-            left, right = ln.split("Payment Type:", 1)
+    for m in matches:
+        gd = m.groupdict()
+        ptype = re.sub(r"\s+", " ", (gd["payment_type"] or "").strip())
+        inv_total = _money_to_decimal(gd["invoice_total"]) or Decimal("0")
+        tax_amt = _money_to_decimal(gd["tax_amount"]) or Decimal("0")
+        taxed = _money_to_decimal(gd["taxed_sales"]) or Decimal("0")
+        nontaxed = _money_to_decimal(gd["nontaxed_sales"]) or Decimal("0")
 
-            left_m = money_pat.findall(left)
-            right_m = money_pat.findall(right)
+        # Sanity check: if swapped, fix it
+        expected_sales = inv_total - tax_amt
+        if (taxed + nontaxed - expected_sales).copy_abs() > Decimal("0.05"):
+            if (nontaxed + taxed - expected_sales).copy_abs() <= Decimal("0.05"):
+                taxed, nontaxed = nontaxed, taxed
 
-            # We need: [sales, tax] on left and [nontaxed, taxed] on right
-            if len(left_m) >= 2 and len(right_m) >= 2:
-                sales = _money_to_decimal(left_m[0])
-                tax = _money_to_decimal(left_m[1])
+        out_by_type[ptype] = {
+            "payment_type": ptype,
+            "invoice_total": inv_total,
+            "tax_amount": tax_amt,
+            "taxed_sales": taxed,
+            "nontaxed_sales": nontaxed,
+            "amount": taxed + nontaxed,  # sales excluding tax
+            "txn_count": None,           # not reliably available in this report
+        }
 
-                # label: remove the first 2 money tokens from left
-                tmp = left
-                tmp = tmp.replace(left_m[0], "", 1).replace(left_m[1], "", 1)
-                label = re.sub(r"\s+", " ", tmp).strip()
-
-                # right side order confirmed: Non-Taxed then Taxed
-                nontaxed = _money_to_decimal(right_m[0])
-                taxed = _money_to_decimal(right_m[1])
-
-                if label and sales is not None:
-                    out.append(
-                        {
-                            "payment_type": label,
-                            "amount": sales,              # what we chart (sales by payment type)
-                            "txn_count": None,
-                            # debug fields (not stored in DB today)
-                            "_tax": tax,
-                            "_nontaxed_sales": nontaxed,
-                            "_taxed_sales": taxed,
-                        }
-                    )
-            i += 1
-            continue
-
-        # Case B: three-line format:
-        #   line i:   "<sales><tax><label>"  (no 'Payment Type:')
-        #   line i+1: "Payment Type:"
-        #   line i+2: "<nontaxed> <taxed>"
-        if i + 2 < len(lines) and lines[i + 1].strip() == "Payment Type:":
-            first = lines[i]
-            third = lines[i + 2]
-            m1 = money_pat.findall(first)
-            m3 = money_pat.findall(third)
-
-            if len(m1) >= 2 and len(m3) >= 2:
-                sales = _money_to_decimal(m1[0])
-                tax = _money_to_decimal(m1[1])
-
-                tmp = first
-                tmp = tmp.replace(m1[0], "", 1).replace(m1[1], "", 1)
-                label = re.sub(r"\s+", " ", tmp).strip()
-
-                # third line order confirmed: Non-Taxed then Taxed
-                nontaxed = _money_to_decimal(m3[0])
-                taxed = _money_to_decimal(m3[1])
-
-                if label and sales is not None:
-                    out.append(
-                        {
-                            "payment_type": label,
-                            "amount": sales,
-                            "txn_count": None,
-                            "_tax": tax,
-                            "_nontaxed_sales": nontaxed,
-                            "_taxed_sales": taxed,
-                        }
-                    )
-                    i += 3
-                    continue
-
-        i += 1
-
-    if not out:
-        sample = "\n".join(lines[:140])
-        raise ValueError(f"Could not extract any payment type subtotals. Sample:\n{sample}")
-
-    return out
+    return list(out_by_type.values())
 
 
-# -----------------------
-# Flask routes
-# -----------------------
+# -----------------------------------------------------------------------------
+# Routes
+# -----------------------------------------------------------------------------
+
 @app.get("/health")
 def health():
     return jsonify({"ok": True})
@@ -429,6 +385,16 @@ def mailgun_inbound():
                 row = cur.fetchone()
                 new_id = row[0] if row else None
 
+        app.logger.info(
+            "Stored: id=%s filename=%s bytes=%s sha256=%s report_type=%s business_date=%s",
+            new_id,
+            filename,
+            len(blob),
+            sha256,
+            report_type,
+            business_date,
+        )
+
         stored.append(
             {
                 "id": new_id,
@@ -443,7 +409,10 @@ def mailgun_inbound():
     return jsonify({"ok": True, "stored": stored})
 
 
-# --- SalesStat endpoints ---
+# -----------------------------------------------------------------------------
+# Parse endpoints: SalesStat
+# -----------------------------------------------------------------------------
+
 @app.post("/parse/salesstat/latest")
 def parse_salesstat_latest():
     try:
@@ -470,8 +439,12 @@ def parse_salesstat_latest():
                 file_id, biz_date, filename, sha256, pdf_bytes = row
                 if not biz_date:
                     return jsonify(
-                        {"ok": False, "error": "Latest salesstat PDF missing business_date; cannot parse"}, 400
-                    )
+                        {
+                            "ok": False,
+                            "error": "Latest salesstat PDF missing business_date; cannot parse into daily table",
+                            "id": file_id,
+                        }
+                    ), 400
 
                 kpis = extract_salesstat_kpis(pdf_bytes)
 
@@ -491,10 +464,10 @@ def parse_salesstat_latest():
                     """,
                     (
                         biz_date,
-                        Decimal(kpis["net_sales"]) if kpis["net_sales"] is not None else None,
-                        Decimal(kpis["gross_sales"]) if kpis["gross_sales"] is not None else None,
+                        kpis["net_sales"],
+                        kpis["gross_sales"],
                         kpis["transactions"],
-                        Decimal(kpis["avg_ticket"]) if kpis["avg_ticket"] is not None else None,
+                        kpis["avg_ticket"],
                     ),
                 )
                 out = cur.fetchone()
@@ -513,7 +486,6 @@ def parse_salesstat_latest():
                 },
             }
         )
-
     except Exception as e:
         app.logger.exception("parse_salesstat_latest failed")
         return jsonify({"ok": False, "error_type": type(e).__name__, "error": str(e)}), 500
@@ -531,7 +503,7 @@ def parse_salesstat_by_date():
         return jsonify({"ok": False, "error": "missing business_date (YYYY-MM-DD)"}), 400
 
     try:
-        business_date = datetime.strptime(business_date_str, "%Y-%m-%d").date()
+        biz_date = datetime.strptime(business_date_str, "%Y-%m-%d").date()
     except ValueError:
         return jsonify({"ok": False, "error": "invalid business_date (expected YYYY-MM-DD)"}), 400
 
@@ -540,25 +512,22 @@ def parse_salesstat_by_date():
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    select id, filename, sha256, file_bytes, business_date
+                    select id, business_date, filename, sha256, file_bytes
                     from raw.inbound_files
                     where report_type = 'salesstat'
                       and business_date = %s
                     order by received_at desc
                     limit 1
                     """,
-                    (business_date,),
+                    (biz_date,),
                 )
                 row = cur.fetchone()
+                if not row:
+                    return jsonify({"ok": False, "error": f"no salesstat PDF found for {business_date_str}"}), 404
 
-        if not row:
-            return jsonify({"ok": False, "error": f"no salesstat PDF found for {business_date_str}"}), 404
+                file_id, biz_date, filename, sha256, pdf_bytes = row
+                kpis = extract_salesstat_kpis(pdf_bytes)
 
-        file_id, filename, sha256, pdf_bytes, biz_date = row
-        kpis = extract_salesstat_kpis(pdf_bytes)
-
-        with connect(get_db_url()) as conn:
-            with conn.cursor() as cur:
                 cur.execute(
                     """
                     insert into analytics.salesstat_daily
@@ -575,10 +544,10 @@ def parse_salesstat_by_date():
                     """,
                     (
                         biz_date,
-                        Decimal(kpis["net_sales"]) if kpis["net_sales"] is not None else None,
-                        Decimal(kpis["gross_sales"]) if kpis["gross_sales"] is not None else None,
+                        kpis["net_sales"],
+                        kpis["gross_sales"],
                         kpis["transactions"],
-                        Decimal(kpis["avg_ticket"]) if kpis["avg_ticket"] is not None else None,
+                        kpis["avg_ticket"],
                     ),
                 )
                 out = cur.fetchone()
@@ -597,13 +566,15 @@ def parse_salesstat_by_date():
                 },
             }
         )
-
     except Exception as e:
         app.logger.exception("parse_salesstat_by_date failed")
         return jsonify({"ok": False, "error_type": type(e).__name__, "error": str(e)}), 500
 
 
-# --- SalesClass endpoints ---
+# -----------------------------------------------------------------------------
+# Parse endpoints: SalesClass
+# -----------------------------------------------------------------------------
+
 @app.post("/parse/salesclass/latest")
 def parse_salesclass_latest():
     try:
@@ -633,155 +604,57 @@ def parse_salesclass_latest():
 
                 rows = extract_salesclass_rows(pdf_bytes)
 
-                # upsert all rows
-                n = 0
+                # Upsert each class row
+                upserted = 0
                 for r in rows:
                     cur.execute(
                         """
                         insert into analytics.salesclass_daily
                           (business_date, class_code, class_name,
-                           ext_price, pct_total, ext_cost, profit, gp_pct, ext_tax, price_plus_tax,
+                           net_sales, cost, gross_profit, margin_pct,
                            source_file_id, source_sha256, updated_at)
                         values
-                          (%s, %s, %s,
-                           %s, %s, %s, %s, %s, %s, %s,
-                           %s, %s, now())
+                          (%s, %s, %s, %s, %s, %s, %s, %s, %s, now())
                         on conflict (business_date, class_code) do update
-                          set class_name      = excluded.class_name,
-                              ext_price       = excluded.ext_price,
-                              pct_total       = excluded.pct_total,
-                              ext_cost        = excluded.ext_cost,
-                              profit          = excluded.profit,
-                              gp_pct          = excluded.gp_pct,
-                              ext_tax         = excluded.ext_tax,
-                              price_plus_tax  = excluded.price_plus_tax,
-                              source_file_id  = excluded.source_file_id,
-                              source_sha256   = excluded.source_sha256,
-                              updated_at      = now()
+                          set class_name   = excluded.class_name,
+                              net_sales    = excluded.net_sales,
+                              cost         = excluded.cost,
+                              gross_profit = excluded.gross_profit,
+                              margin_pct   = excluded.margin_pct,
+                              source_file_id = excluded.source_file_id,
+                              source_sha256  = excluded.source_sha256,
+                              updated_at   = now()
                         """,
                         (
                             biz_date,
                             r["class_code"],
                             r["class_name"],
-                            Decimal(r["ext_price"]) if r["ext_price"] is not None else None,
-                            Decimal(r["pct_total"]) if r["pct_total"] is not None else None,
-                            Decimal(r["ext_cost"]) if r["ext_cost"] is not None else None,
-                            Decimal(r["profit"]) if r["profit"] is not None else None,
-                            Decimal(r["gp_pct"]) if r["gp_pct"] is not None else None,
-                            Decimal(r["ext_tax"]) if r["ext_tax"] is not None else None,
-                            Decimal(r["price_plus_tax"]) if r["price_plus_tax"] is not None else None,
+                            r["net_sales"],
+                            r["cost"],
+                            r["gross_profit"],
+                            r["margin_pct"],
                             file_id,
                             sha256,
                         ),
                     )
-                    n += 1
+                    upserted += 1
 
         return jsonify(
             {
                 "ok": True,
                 "source": {"id": file_id, "filename": filename, "sha256": sha256, "business_date": str(biz_date)},
-                "rows_upserted": n,
+                "upserted_rows": upserted,
             }
         )
-
     except Exception as e:
         app.logger.exception("parse_salesclass_latest failed")
         return jsonify({"ok": False, "error_type": type(e).__name__, "error": str(e)}), 500
 
 
-@app.post("/parse/salesclass/by-date")
-def parse_salesclass_by_date():
-    try:
-        require_parse_token()
-    except PermissionError as e:
-        return jsonify({"ok": False, "error": str(e)}), 401
+# -----------------------------------------------------------------------------
+# Parse endpoints: PayType
+# -----------------------------------------------------------------------------
 
-    business_date_str = (request.args.get("business_date") or "").strip()
-    if not business_date_str:
-        return jsonify({"ok": False, "error": "missing business_date (YYYY-MM-DD)"}), 400
-
-    try:
-        business_date = datetime.strptime(business_date_str, "%Y-%m-%d").date()
-    except ValueError:
-        return jsonify({"ok": False, "error": "invalid business_date (expected YYYY-MM-DD)"}), 400
-
-    try:
-        with connect(get_db_url()) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    select id, business_date, filename, sha256, file_bytes
-                    from raw.inbound_files
-                    where report_type='salesclass'
-                      and business_date=%s
-                    order by received_at desc
-                    limit 1
-                    """,
-                    (business_date,),
-                )
-                row = cur.fetchone()
-                if not row:
-                    return jsonify({"ok": False, "error": f"No salesclass PDF found for {business_date_str}"}), 404
-
-                file_id, biz_date, filename, sha256, pdf_bytes = row
-                rows = extract_salesclass_rows(pdf_bytes)
-
-                n = 0
-                for r in rows:
-                    cur.execute(
-                        """
-                        insert into analytics.salesclass_daily
-                          (business_date, class_code, class_name,
-                           ext_price, pct_total, ext_cost, profit, gp_pct, ext_tax, price_plus_tax,
-                           source_file_id, source_sha256, updated_at)
-                        values
-                          (%s, %s, %s,
-                           %s, %s, %s, %s, %s, %s, %s,
-                           %s, %s, now())
-                        on conflict (business_date, class_code) do update
-                          set class_name      = excluded.class_name,
-                              ext_price       = excluded.ext_price,
-                              pct_total       = excluded.pct_total,
-                              ext_cost        = excluded.ext_cost,
-                              profit          = excluded.profit,
-                              gp_pct          = excluded.gp_pct,
-                              ext_tax         = excluded.ext_tax,
-                              price_plus_tax  = excluded.price_plus_tax,
-                              source_file_id  = excluded.source_file_id,
-                              source_sha256   = excluded.source_sha256,
-                              updated_at      = now()
-                        """,
-                        (
-                            biz_date,
-                            r["class_code"],
-                            r["class_name"],
-                            Decimal(r["ext_price"]) if r["ext_price"] is not None else None,
-                            Decimal(r["pct_total"]) if r["pct_total"] is not None else None,
-                            Decimal(r["ext_cost"]) if r["ext_cost"] is not None else None,
-                            Decimal(r["profit"]) if r["profit"] is not None else None,
-                            Decimal(r["gp_pct"]) if r["gp_pct"] is not None else None,
-                            Decimal(r["ext_tax"]) if r["ext_tax"] is not None else None,
-                            Decimal(r["price_plus_tax"]) if r["price_plus_tax"] is not None else None,
-                            file_id,
-                            sha256,
-                        ),
-                    )
-                    n += 1
-
-        return jsonify(
-            {
-                "ok": True,
-                "source": {"id": file_id, "filename": filename, "sha256": sha256, "business_date": str(biz_date)},
-                "rows_upserted": n,
-            }
-        )
-
-    except Exception as e:
-        app.logger.exception("parse_salesclass_by_date failed")
-        return jsonify({"ok": False, "error_type": type(e).__name__, "error": str(e)}), 500
-
-
-# --- PayType endpoints ---
 @app.post("/parse/paytype/latest")
 def parse_paytype_latest():
     try:
@@ -792,12 +665,11 @@ def parse_paytype_latest():
     try:
         with connect(get_db_url()) as conn:
             with conn.cursor() as cur:
-                # catch older rows that didn't infer report_type
                 cur.execute(
                     """
-                    select id, business_date, filename, mail_subject, sha256, file_bytes
+                    select id, business_date, filename, sha256, file_bytes
                     from raw.inbound_files
-                    where (report_type='paytype' or filename ilike 'arinvregreport%')
+                    where report_type = 'paytype'
                     order by received_at desc
                     limit 1
                     """
@@ -806,147 +678,58 @@ def parse_paytype_latest():
                 if not row:
                     return jsonify({"ok": False, "error": "No paytype PDFs found in raw.inbound_files"}), 404
 
-                file_id, biz_date, filename, mail_subject, sha256, pdf_bytes = row
-
-                # backfill report_type and business_date if missing
+                file_id, biz_date, filename, sha256, pdf_bytes = row
                 if not biz_date:
-                    biz_date = infer_business_date(filename, mail_subject)
-                    if biz_date:
-                        cur.execute("update raw.inbound_files set business_date=%s where id=%s", (biz_date, file_id))
-                    else:
-                        return jsonify({"ok": False, "error": "Paytype PDF missing business_date"}), 400
+                    return jsonify({"ok": False, "error": "Latest paytype PDF missing business_date"}), 400
 
-                cur.execute("update raw.inbound_files set report_type='paytype' where id=%s", (file_id,))
+                totals = extract_paytype_totals(pdf_bytes)
 
-                rows = extract_paytype_rows(pdf_bytes)
-
-                # upsert into analytics.paytype_daily (current schema)
-                n = 0
-                for r in rows:
+                upserted = 0
+                for t in totals:
                     cur.execute(
                         """
                         insert into analytics.paytype_daily
-                          (business_date, payment_type, amount, txn_count, source_file_id, source_sha256, updated_at)
+                          (business_date, payment_type,
+                           amount, txn_count,
+                           taxed_sales, nontaxed_sales, tax_amount, invoice_total,
+                           source_file_id, source_sha256, updated_at)
                         values
-                          (%s, %s, %s, %s, %s, %s, now())
+                          (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
                         on conflict (business_date, payment_type) do update
-                          set amount = excluded.amount,
-                              txn_count = excluded.txn_count,
+                          set amount        = excluded.amount,
+                              txn_count     = excluded.txn_count,
+                              taxed_sales   = excluded.taxed_sales,
+                              nontaxed_sales= excluded.nontaxed_sales,
+                              tax_amount    = excluded.tax_amount,
+                              invoice_total = excluded.invoice_total,
                               source_file_id = excluded.source_file_id,
-                              source_sha256 = excluded.source_sha256,
-                              updated_at = now()
+                              source_sha256  = excluded.source_sha256,
+                              updated_at    = now()
                         """,
                         (
                             biz_date,
-                            r["payment_type"],
-                            r["amount"],
-                            r["txn_count"],
+                            t["payment_type"],
+                            t["amount"],
+                            t["txn_count"],
+                            t["taxed_sales"],
+                            t["nontaxed_sales"],
+                            t["tax_amount"],
+                            t["invoice_total"],
                             file_id,
                             sha256,
                         ),
                     )
-                    n += 1
+                    upserted += 1
 
         return jsonify(
             {
                 "ok": True,
                 "source": {"id": file_id, "filename": filename, "sha256": sha256, "business_date": str(biz_date)},
-                "rows_upserted": n,
+                "upserted_rows": upserted,
             }
         )
-
     except Exception as e:
         app.logger.exception("parse_paytype_latest failed")
-        return jsonify({"ok": False, "error_type": type(e).__name__, "error": str(e)}), 500
-
-
-@app.post("/parse/paytype/by-date")
-def parse_paytype_by_date():
-    try:
-        require_parse_token()
-    except PermissionError as e:
-        return jsonify({"ok": False, "error": str(e)}), 401
-
-    business_date_str = (request.args.get("business_date") or "").strip()
-    if not business_date_str:
-        return jsonify({"ok": False, "error": "missing business_date (YYYY-MM-DD)"}), 400
-
-    try:
-        target_date = datetime.strptime(business_date_str, "%Y-%m-%d").date()
-    except ValueError:
-        return jsonify({"ok": False, "error": "invalid business_date (expected YYYY-MM-DD)"}), 400
-
-    mmddyy = target_date.strftime("%m%d%y")
-
-    try:
-        with connect(get_db_url()) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    select id, business_date, filename, mail_subject, sha256, file_bytes
-                    from raw.inbound_files
-                    where
-                      (report_type='paytype' and business_date=%s)
-                      or (filename ilike 'arinvregreport%' and (
-                            business_date=%s
-                            or (business_date is null and filename ilike %s)
-                         ))
-                    order by received_at desc
-                    limit 1
-                    """,
-                    (target_date, target_date, f"%{mmddyy}%"),
-                )
-                row = cur.fetchone()
-
-                if not row:
-                    return jsonify({"ok": False, "error": f"No paytype PDF found for {business_date_str}"}), 404
-
-                file_id, biz_date, filename, mail_subject, sha256, pdf_bytes = row
-
-                if not biz_date:
-                    biz_date = infer_business_date(filename, mail_subject) or target_date
-                    cur.execute("update raw.inbound_files set business_date=%s where id=%s", (biz_date, file_id))
-
-                cur.execute("update raw.inbound_files set report_type='paytype' where id=%s", (file_id,))
-
-                rows = extract_paytype_rows(pdf_bytes)
-
-                n = 0
-                for r in rows:
-                    cur.execute(
-                        """
-                        insert into analytics.paytype_daily
-                          (business_date, payment_type, amount, txn_count, source_file_id, source_sha256, updated_at)
-                        values
-                          (%s, %s, %s, %s, %s, %s, now())
-                        on conflict (business_date, payment_type) do update
-                          set amount = excluded.amount,
-                              txn_count = excluded.txn_count,
-                              source_file_id = excluded.source_file_id,
-                              source_sha256 = excluded.source_sha256,
-                              updated_at = now()
-                        """,
-                        (
-                            biz_date,
-                            r["payment_type"],
-                            r["amount"],
-                            r["txn_count"],
-                            file_id,
-                            sha256,
-                        ),
-                    )
-                    n += 1
-
-        return jsonify(
-            {
-                "ok": True,
-                "source": {"id": file_id, "filename": filename, "sha256": sha256, "business_date": str(biz_date)},
-                "rows_upserted": n,
-            }
-        )
-
-    except Exception as e:
-        app.logger.exception("parse_paytype_by_date failed")
         return jsonify({"ok": False, "error_type": type(e).__name__, "error": str(e)}), 500
 
 
