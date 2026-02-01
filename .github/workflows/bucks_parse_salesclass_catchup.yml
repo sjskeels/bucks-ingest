@@ -1,0 +1,48 @@
+name: Buck's Parse SalesClass (Catch-up)
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Covers both CST and CDT without relying on GitHub timezone support
+    # CST: 3:10am = 09:10 UTC, 12:10pm = 18:10 UTC
+    # CDT: 3:10am = 08:10 UTC, 12:10pm = 17:10 UTC
+    - cron: "10 8 * * *"
+    - cron: "10 9 * * *"
+    - cron: "10 17 * * *"
+    - cron: "10 18 * * *"
+
+jobs:
+  parse-salesclass:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Parse SalesClass for last 7 Chicago business days (self-healing)
+        env:
+          BASE: https://bucks-ingest-webhook-production.up.railway.app
+          TOKEN: ${{ secrets.X_PARSE_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${TOKEN}" ]; then
+            echo "ERROR: secrets.X_PARSE_TOKEN is empty."
+            exit 1
+          fi
+
+          for i in 0 1 2 3 4 5 6 7; do
+            BD=$(TZ=America/Chicago date -d "${i} day ago" +%F)
+            echo "==> Parsing SalesClass business_date=${BD}"
+
+            HTTP=$(curl -sS -o /tmp/resp.json -w "%{http_code}" \
+              -X POST "${BASE}/parse/salesclass/by-date?business_date=${BD}" \
+              -H "X-Parse-Token: ${TOKEN}")
+
+            cat /tmp/resp.json || true
+
+            if [ "${HTTP}" = "200" ] || [ "${HTTP}" = "201" ] || [ "${HTTP}" = "204" ]; then
+              echo "OK (${HTTP}) for ${BD}"
+            elif [ "${HTTP}" = "404" ] || [ "${HTTP}" = "409" ]; then
+              echo "SKIP (${HTTP}) for ${BD} (no file or already parsed)"
+            else
+              echo "ERROR: HTTP ${HTTP} for ${BD}"
+              exit 1
+            fi
+          done
