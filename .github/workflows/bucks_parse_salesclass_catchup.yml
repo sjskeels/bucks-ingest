@@ -17,17 +17,17 @@ jobs:
     steps:
       - name: Parse SalesClass for last 7 Chicago business days (self-healing)
         env:
-          BASE: https://bucks-ingest-webhook-production.up.railway.app
-          TOKEN: ${{ secrets.X_PARSE_TOKEN }}
+          BASE: ${{ secrets.PARSE_URL }}
+	  TOKEN: ${{ secrets.PARSE_TOKEN }}
         run: |
           set -euo pipefail
 
           if [ -z "${TOKEN}" ]; then
-            echo "ERROR: secrets.X_PARSE_TOKEN is empty."
+            echo "ERROR: secrets.PARSE_TOKEN is empty."
             exit 1
           fi
 
-          for i in 0 1 2 3 4 5 6 7; do
+          for i in 0 1 2 3 4 5 6; do
             BD=$(TZ=America/Chicago date -d "${i} day ago" +%F)
             echo "==> Parsing SalesClass business_date=${BD}"
 
