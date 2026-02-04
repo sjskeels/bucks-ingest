@@ -2,6 +2,11 @@ name: Buck's Parse SalesClass (Catch-up)
 
 on:
   workflow_dispatch:
+    inputs:
+      run_note:
+        description: "Manual run note (ignored by script)"
+        required: false
+        default: "manual"
   schedule:
     # Covers both CST and CDT without relying on GitHub timezone support
     # CST: 3:10am = 09:10 UTC, 12:10pm = 18:10 UTC
