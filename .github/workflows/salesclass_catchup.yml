@@ -7,6 +7,12 @@ on:
         description: "Manual run note (ignored by script)"
         required: false
         default: "manual"
+
+  push:
+    branches: [ "main" ]
+    paths:
+      - ".github/workflows/salesclass_catchup.yml"
+
   schedule:
     # Covers both CST and CDT without relying on GitHub timezone support
     # CST: 3:10am = 09:10 UTC, 12:10pm = 18:10 UTC
@@ -21,13 +27,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Parse SalesClass for last 7 Chicago business days (self-healing)
+        shell: bash
         env:
           BASE: ${{ secrets.PARSE_URL }}
-	  TOKEN: ${{ secrets.PARSE_TOKEN }}
+          TOKEN: ${{ secrets.PARSE_TOKEN }}
         run: |
           set -euo pipefail
 
-          if [ -z "${TOKEN}" ]; then
+          if [ -z "${BASE:-}" ]; then
+            echo "ERROR: secrets.PARSE_URL is empty."
+            exit 1
+          fi
+
+          if [ -z "${TOKEN:-}" ]; then
             echo "ERROR: secrets.PARSE_TOKEN is empty."
             exit 1
           fi
