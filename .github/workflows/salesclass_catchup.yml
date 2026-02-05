@@ -7,12 +7,6 @@ on:
         description: "Manual run note (ignored by script)"
         required: false
         default: "manual"
-
-  push:
-    branches: [ "main" ]
-    paths:
-      - ".github/workflows/salesclass_catchup.yml"
-
   schedule:
     # Covers both CST and CDT without relying on GitHub timezone support
     # CST: 3:10am = 09:10 UTC, 12:10pm = 18:10 UTC
@@ -27,7 +21,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Parse SalesClass for last 7 Chicago business days (self-healing)
-        shell: bash
         env:
           BASE: ${{ secrets.PARSE_URL }}
           TOKEN: ${{ secrets.PARSE_TOKEN }}
@@ -44,22 +37,61 @@ jobs:
             exit 1
           fi
 
-          for i in 0 1 2 3 4 5 6; do
+          any_ok=0
+          had_transient=0
+
+          request_with_retry () {
+            local url="$1"
+            local tries=0
+            local http="000"
+
+            while true; do
+              tries=$((tries+1))
+
+              http=$(curl -sS -o /tmp/resp.json -w "%{http_code}" \
+                -X POST "$url" \
+                -H "X-Parse-Token: ${TOKEN}" \
+                || echo "000")
+
+              cat /tmp/resp.json 2>/dev/null || true
+
+              # Transient/unavailable cases: retry a few times, then return code (don’t kill the whole run early)
+              if [ "$http" = "000" ] || [ "$http" = "502" ] || [ "$http" = "503" ] || [ "$http" = "504" ]; then
+                had_transient=1
+                if [ $tries -lt 4 ]; then
+                  sleep $((tries * 5))
+                  continue
+                fi
+              fi
+
+              echo "$http"
+              return 0
+            done
+          }
+
+          # IMPORTANT: run OLDEST -> NEWEST so “today” can’t block backfill
+          for i in 6 5 4 3 2 1 0; do
             BD=$(TZ=America/Chicago date -d "${i} day ago" +%F)
             echo "==> Parsing SalesClass business_date=${BD}"
 
-            HTTP=$(curl -sS -o /tmp/resp.json -w "%{http_code}" \
-              -X POST "${BASE}/parse/salesclass/by-date?business_date=${BD}" \
-              -H "X-Parse-Token: ${TOKEN}")
-
-            cat /tmp/resp.json || true
+            url="${BASE%/}/parse/salesclass/by-date?business_date=${BD}"
+            HTTP="$(request_with_retry "$url")"
 
             if [ "${HTTP}" = "200" ] || [ "${HTTP}" = "201" ] || [ "${HTTP}" = "204" ]; then
+              any_ok=1
               echo "OK (${HTTP}) for ${BD}"
             elif [ "${HTTP}" = "404" ] || [ "${HTTP}" = "409" ]; then
               echo "SKIP (${HTTP}) for ${BD} (no file or already parsed)"
+            elif [ "${HTTP}" = "000" ] || [ "${HTTP}" = "502" ] || [ "${HTTP}" = "503" ] || [ "${HTTP}" = "504" ]; then
+              echo "WARN (${HTTP}) for ${BD} (transient). Continuing."
             else
               echo "ERROR: HTTP ${HTTP} for ${BD}"
               exit 1
             fi
           done
+
+          # If we only saw transient failures and never succeeded once, fail the job (service likely down)
+          if [ "$any_ok" = "0" ] && [ "$had_transient" = "1" ]; then
+            echo "ERROR: No successful parses; only transient failures. Service likely unreachable."
+            exit 1
+          fi
