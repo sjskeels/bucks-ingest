@@ -2,3 +2,5 @@
 gunicorn==21.2.0
 psycopg[binary]==3.2.13
 pypdf==5.1.0
+fastapi
+uvicorn[standard]
