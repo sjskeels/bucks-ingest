@@ -46,7 +46,7 @@ def _log(event: str, **fields: Any) -> None:
 
 
 # -----------------------------------------------------------------------------
-# App + safety: never crash worker; structured JSON errors; avoid 500s
+# App + hard safety: never crash worker; structured JSON errors
 # -----------------------------------------------------------------------------
 
 app = FastAPI(title="bucks-ingest-webhook")
@@ -78,7 +78,7 @@ async def request_context_middleware(request: Request, call_next):
     try:
         response = await call_next(request)
     except Exception as e:
-        # Last-resort catch: never crash the worker, never emit 500 stack traces to client.
+        # last-resort catch: never crash the worker
         _log(
             "request.unhandled_exception",
             request_id=request_id,
@@ -89,7 +89,6 @@ async def request_context_middleware(request: Request, call_next):
         )
         response = _json_error(request_id, "exception", str(e), http_status=200)
 
-    # attach request id + timing
     try:
         response.headers["X-Request-Id"] = request_id
         response.headers["X-Elapsed-Ms"] = str(int((time.time() - start) * 1000))
@@ -103,7 +102,7 @@ async def http_exception_handler(request: Request, exc: FastAPIHTTPException):
     request_id = request.headers.get("X-Request-Id") or uuid.uuid4().hex
     status = int(getattr(exc, "status_code", 200) or 200)
 
-    # Keep real 4xx for client errors; downgrade any 5xx to 200 with structured JSON.
+    # never emit 5xx from our app (502/000 were killing the workflow)
     http_status = status if status < 500 else 200
 
     detail = getattr(exc, "detail", None)
@@ -114,7 +113,6 @@ async def http_exception_handler(request: Request, exc: FastAPIHTTPException):
     else:
         message = str(detail) if detail else str(exc)
 
-    # default classification by status
     et = "http_error"
     if status == 401:
         et = "unauthorized"
@@ -123,7 +121,6 @@ async def http_exception_handler(request: Request, exc: FastAPIHTTPException):
     elif status == 409:
         et = "conflict"
 
-    # allow explicit error_type override from detail
     if extra and isinstance(extra.get("error_type"), str):
         et = str(extra["error_type"])
 
@@ -145,7 +142,6 @@ async def http_exception_handler(request: Request, exc: FastAPIHTTPException):
 # -----------------------------------------------------------------------------
 
 def _expected_token() -> str:
-    # Accept either env name; GitHub uses secrets.PARSE_TOKEN -> env PARSE_TOKEN
     tok = os.getenv("PARSE_TOKEN") or os.getenv("X_PARSE_TOKEN") or ""
     return tok.strip()
 
@@ -158,7 +154,6 @@ def _require_token(x_parse_token: Optional[str]) -> None:
             detail={"error": "Server missing PARSE_TOKEN env var", "error_type": "server_misconfig"},
         )
     if not x_parse_token or x_parse_token.strip() != exp:
-        # keep it 200 with a structured body (so curl/automation doesn't treat as hard failure)
         raise FastAPIHTTPException(
             status_code=200,
             detail={"error": "Invalid X-Parse-Token", "error_type": "unauthorized"},
@@ -184,7 +179,6 @@ def _pdf_to_text(pdf_bytes: bytes) -> str:
     Extract text from PDF bytes using whichever library is installed.
     Prefers PyMuPDF (fitz), then pdfplumber, then pypdf.
     """
-    # PyMuPDF
     try:
         import fitz  # type: ignore
 
@@ -196,7 +190,6 @@ def _pdf_to_text(pdf_bytes: bytes) -> str:
     except Exception:
         pass
 
-    # pdfplumber
     try:
         import pdfplumber  # type: ignore
 
@@ -205,7 +198,6 @@ def _pdf_to_text(pdf_bytes: bytes) -> str:
     except Exception:
         pass
 
-    # pypdf
     try:
         from pypdf import PdfReader  # type: ignore
 
@@ -242,33 +234,27 @@ def _table_columns(cur, schema: str, table: str) -> List[str]:
 
 
 def _prepare_insert(cur, schema: str, table: str, rows: List[Dict[str, Any]]):
-    """
-    Build INSERT SQL and insert column list for rows.
-    Returns (sql, insert_cols) or (None, None) if table not found.
-    """
     if not rows:
-        return None, None
+        return None, None, None
 
     cols = _table_columns(cur, schema, table)
     if not cols:
-        return None, None
+        return None, None, None
 
-    # Only insert columns that exist in the table
     insert_cols = [c for c in cols if c in rows[0].keys()]
 
-    # If updated_at exists and caller didn't provide it, set it
     if "updated_at" in cols and "updated_at" not in insert_cols:
         insert_cols.append("updated_at")
         for r in rows:
             r["updated_at"] = datetime.utcnow()
 
     if not insert_cols:
-        return None, None
+        return None, None, None
 
     cols_sql = ", ".join(f'"{c}"' for c in insert_cols)
     vals_sql = ", ".join(f"%({c})s" for c in insert_cols)
     sql = f'INSERT INTO "{schema}"."{table}" ({cols_sql}) VALUES ({vals_sql})'
-    return sql, insert_cols
+    return sql, insert_cols, cols
 
 
 def _safe_insert_rows(
@@ -282,15 +268,15 @@ def _safe_insert_rows(
     max_error_samples: int = 5,
 ) -> Dict[str, Any]:
     """
-    Insert rows into a table without aborting the day.
-    - Uses savepoints to skip rows that violate constraints.
-    - Returns counts + small error samples (when debug=true).
+    Insert rows without aborting the day:
+    - SAVEPOINT per row
+    - skip DB/constraint failures
     """
     out: Dict[str, Any] = {"schema": schema, "table": table, "inserted": 0, "skipped_db": 0}
     if not rows:
         return out
 
-    sql, insert_cols = _prepare_insert(cur, schema, table, rows)
+    sql, insert_cols, _cols = _prepare_insert(cur, schema, table, rows)
     if not sql or not insert_cols:
         out["note"] = "table_missing_or_no_columns"
         _log("db.insert.skip_table", request_id=request_id, schema=schema, table=table, note=out["note"])
@@ -333,9 +319,6 @@ def _safe_insert_rows(
 
 
 def _get_inbound_file(cur, report_type: str, business_date: Optional[date]) -> Tuple[int, date, str, str, bytes]:
-    """
-    Returns: (id, business_date, filename, sha256, file_bytes)
-    """
     if business_date is None:
         cur.execute(
             """
@@ -371,7 +354,7 @@ def _get_inbound_file(cur, report_type: str, business_date: Optional[date]) -> T
 
 
 # -----------------------------------------------------------------------------
-# SalesClass parsing
+# SalesClass parsing (anchored to TRUE report schema; resilient to PDF glue)
 # -----------------------------------------------------------------------------
 
 _NOISE_PREFIXES = (
@@ -382,24 +365,31 @@ _NOISE_PREFIXES = (
     "Extended",
     "Printed:",
 )
+_NOISE_CONTAINS = ("Reports Totals", "Group Totals", "Group B Totals")
+_NOISE_SUFFIXES = ("DSSumClsG", "DSSumCls")
 
-_NOISE_CONTAINS = (
-    "Reports Totals",
-    "Group Totals",
-    "Group B Totals",
-)
-
-_NOISE_SUFFIXES = ("DSSumClsG",)
+_DEC2 = r"-?\d[\d,]*\.\d{2}"
 
 
 def _clean_text(s: str) -> str:
     s = (s or "").replace("\r", "\n").replace("\t", " ")
-    s = re.sub(r"<BLANK>", " ", s, flags=re.I)
-    # normalize split negatives "- 1960.24%" -> "-1960.24%"
+    # keep literal "<BLANK>" token (it is a valid Class value)
+    s = re.sub(r"\s+", " ", s).strip()
+
+    # normalize "- 1960.24%" -> "-1960.24%"
     s = re.sub(r"(?<=\s)-\s+(?=\d)", "-", s)
-    # add spaces between glued tokens: "1.64HILLMAN" -> "1.64 HILLMAN"
+
+    # insert boundaries: "1.64HILLMAN" -> "1.64 HILLMAN"
     s = re.sub(r"(\d)([A-Za-z])", r"\1 \2", s)
     s = re.sub(r"([A-Za-z])(\d)", r"\1 \2", s)
+
+    # split glued decimals: "59.4564.431.27" -> "59.45 64.43 1.27"
+    s = re.sub(r"(\d\.\d{2})(?=\d)", r"\1 ", s)
+
+    # split decimal followed by minus sign: "5.00-5.00" -> "5.00 -5.00"
+    s = re.sub(r"(\d\.\d{2})(?=-)", r"\1 ", s)
+
+    # collapse
     s = " ".join(s.split())
     return s.strip()
 
@@ -420,76 +410,187 @@ def _dec(x: str) -> Optional[Decimal]:
     return -d if neg_paren else d
 
 
-def _try_parse_salesclass_row(buf: str) -> Optional[Dict[str, Any]]:
-    """
-    Parse a single "Sales by Class Summary" row from a rolling buffer.
-    Typical format:
-      ext_price ext_cost profit gp_pct% ext_tax CLASS NAME ... price_plus_tax CLASSCODE pct_total
+def _is_class_code(tok: str) -> bool:
+    if not tok:
+        return False
+    if tok.upper() == "<BLANK>":
+        return True
+    # numeric codes (01, 116, etc)
+    if re.fullmatch(r"\d{1,4}", tok):
+        return True
+    # alpha codes (AUTO, CLNG, E, _COUPO, etc)
+    if re.fullmatch(r"[A-Z_][A-Z0-9_]{0,10}", tok):
+        return True
+    return False
 
-    Handles wrapped lines by using the rolling buffer.
+
+def _parse_report_order(tokens: List[str]) -> Optional[Dict[str, Any]]:
     """
-    s = _clean_text(buf)
-    if not s:
+    TRUE report schema (from screenshots):
+      class_code, class_name (optional), ext_price, pct_total, ext_cost, profit, gp_pct%, ext_tax, price_plus_tax, sales_per
+    Works when extractor preserves left-to-right reasonably.
+    """
+    if not tokens:
         return None
 
-    # skip obvious non-rows
+    cc = tokens[0].strip()
+    if not _is_class_code(cc):
+        return None
+
+    # find first decimal token => ext_price; everything between is class_name
+    i = 1
+    while i < len(tokens) and not re.fullmatch(_DEC2, tokens[i]):
+        i += 1
+    if i >= len(tokens):
+        return None
+
+    class_name = " ".join(tokens[1:i]).strip()
+
+    # now expect: ext_price pct_total ext_cost profit gp_pct% ext_tax price_plus_tax sales_per
+    need = 8
+    if i + need > len(tokens):
+        return None
+
+    ext_price = _dec(tokens[i])
+    pct_total = _dec(tokens[i + 1])
+    ext_cost = _dec(tokens[i + 2])
+    profit = _dec(tokens[i + 3])
+
+    gp_tok = tokens[i + 4]
+    if not gp_tok.endswith("%"):
+        return None
+    gp_pct = _dec(gp_tok.replace("%", ""))
+
+    ext_tax = _dec(tokens[i + 5])
+    price_plus_tax = _dec(tokens[i + 6])
+    sales_per = _dec(tokens[i + 7])
+
+    if ext_price is None or ext_cost is None or profit is None or gp_pct is None:
+        return None
+
+    return {
+        "class_code": "<BLANK>" if cc.upper() == "<BLANK>" else cc,
+        "class_name": class_name,
+        "ext_price": ext_price,
+        "pct_total": pct_total,
+        "ext_cost": ext_cost,
+        "profit": profit,
+        "gp_pct": gp_pct,
+        "ext_tax": ext_tax,
+        "price_plus_tax": price_plus_tax,
+        "sales_per": sales_per,
+        "_format": "report_order",
+    }
+
+
+def _parse_extraction_scrambled(s: str) -> Optional[Dict[str, Any]]:
+    """
+    Handles the common PDF-extracted scramble/glue you pasted:
+      CC ext_price ext_cost profit gp% ext_tax CLASSNAME sales_per price_plus_tax pct_total
+    Also handles when CC is missing at start but appears near the end:
+      ext_price ext_cost profit gp% ext_tax CLASSNAME price_plus_tax CC pct_total
+    """
+    s = _clean_text(s)
+    if not s or any(s.startswith(p) for p in _NOISE_PREFIXES) or any(x in s for x in _NOISE_CONTAINS) or any(s.endswith(p) for p in _NOISE_SUFFIXES):
+        return None
     if s == "Class":
         return None
-    if any(s.startswith(p) for p in _NOISE_PREFIXES):
+
+    # locate gp% (e.g. 27.24%)
+    m_gp = re.search(rf"(?P<gp>{_DEC2})%\s+", s)
+    if not m_gp:
         return None
-    if any(x in s for x in _NOISE_CONTAINS):
-        return None
-    if any(s.endswith(p) for p in _NOISE_SUFFIXES):
+    gp_pct = _dec(m_gp.group("gp"))
+
+    left = s[: m_gp.start()].strip()
+    right = s[m_gp.end() :].strip()
+
+    # left should end with 3 decimals: ext_price ext_cost profit, and may start with class_code
+    left_toks = left.split()
+    if len(left_toks) < 3:
         return None
 
-    # must start with a number or "(" (negative via parens)
-    if not re.match(r"^[\d(]", s):
+    # attempt class_code at start
+    class_code: Optional[str] = None
+    if left_toks and _is_class_code(left_toks[0]):
+        class_code = "<BLANK>" if left_toks[0].upper() == "<BLANK>" else left_toks[0]
+        num_toks = left_toks[1:]
+    else:
+        num_toks = left_toks
+
+    if len(num_toks) < 3:
         return None
 
-    # pct_total is the last number on the line (e.g. 0.47)
-    m = re.search(r"(?P<pct_total>\d[\d,]*\.\d{2})\s*$", s)
-    if not m:
+    # take last 3 decimals from num_toks as ext_price, ext_cost, profit (robust even if extra junk precedes)
+    dec_idx = [i for i, t in enumerate(num_toks) if re.fullmatch(_DEC2, t)]
+    if len(dec_idx) < 3:
         return None
-    pct_total = _dec(m.group("pct_total"))
-    left = s[: m.start()].rstrip()
+    a, b, c = dec_idx[-3], dec_idx[-2], dec_idx[-1]
+    ext_price = _dec(num_toks[a])
+    ext_cost = _dec(num_toks[b])
+    profit = _dec(num_toks[c])
 
-    # tail: price_plus_tax then optional class_code (may be glued)
-    m = re.search(
-        r"(?P<price_plus_tax>\d[\d,]*\.\d{2})\s*(?P<class_code>[A-Z0-9_]{0,10})\s*$",
-        left,
-    )
-    if not m:
+    # now parse right: ext_tax then some text then trailing numbers
+    # ext_tax must be first decimal after gp
+    m_tax = re.match(rf"^(?P<tax>{_DEC2})\s*(?P<after>.*)$", right)
+    if not m_tax:
         return None
-    price_plus_tax = _dec(m.group("price_plus_tax"))
-    class_code = (m.group("class_code") or "").strip() or None
-    left = left[: m.start()].rstrip()
+    ext_tax = _dec(m_tax.group("tax"))
+    after = (m_tax.group("after") or "").strip()
 
-    # head: ext_price ext_cost profit gp_pct%
-    m = re.match(
-        r"(?P<ext_price>-?\d[\d,]*\.\d{2})\s+"
-        r"(?P<ext_cost>-?\d[\d,]*\.\d{2})\s+"
-        r"(?P<profit>-?\d[\d,]*\.\d{2})\s+"
-        r"(?P<gp_pct>-?\d[\d,]*\.\d{2})%\s*"
-        r"(?P<rest>.+)$",
-        left,
-    )
-    if not m:
+    # tokens in "after" may contain class_name + trailing decimals and/or class_code
+    after_clean = _clean_text(after)
+    toks = after_clean.split()
+
+    # pull all decimal tokens from end
+    # expected end usually: sales_per price_plus_tax pct_total
+    # sometimes: price_plus_tax class_code pct_total
+    dec_positions = [i for i, t in enumerate(toks) if re.fullmatch(_DEC2, t)]
+    if len(dec_positions) < 2:
         return None
 
-    ext_price = _dec(m.group("ext_price"))
-    ext_cost = _dec(m.group("ext_cost"))
-    profit = _dec(m.group("profit"))
-    gp_pct = _dec(m.group("gp_pct"))
-    rest = (m.group("rest") or "").strip()
-    if not rest:
-        return None
+    # pct_total = last decimal token (not necessarily last token)
+    last_dec_pos = dec_positions[-1]
+    pct_total = _dec(toks[last_dec_pos])
 
-    # rest: ext_tax then class_name (ext_tax may be glued to class_name)
-    m = re.match(r"(?P<ext_tax>-?\d[\d,]*\.\d{2})\s*(?P<class_name>.*)$", rest)
-    if not m:
+    # try to find class_code near end if missing at start:
+    # pattern: <decimal> <CLASSCODE> <decimal(pct_total)>
+    if class_code is None:
+        if last_dec_pos >= 2 and _is_class_code(toks[last_dec_pos - 1]):
+            class_code = "<BLANK>" if toks[last_dec_pos - 1].upper() == "<BLANK>" else toks[last_dec_pos - 1]
+            # price_plus_tax likely the decimal before class_code (if present)
+            if re.fullmatch(_DEC2, toks[last_dec_pos - 2]):
+                price_plus_tax = _dec(toks[last_dec_pos - 2])
+                sales_per = None
+                name_end = last_dec_pos - 2
+            else:
+                price_plus_tax = None
+                sales_per = None
+                name_end = last_dec_pos - 1
+        else:
+            # cannot safely recover class_code
+            return None
+    else:
+        # class_code known at start, so expect last decimals include price_plus_tax and pct_total, and optionally sales_per
+        # Identify last two decimals as price_plus_tax and pct_total; optional third-from-last as sales_per
+        # We need their positions in toks:
+        # Find second last decimal token position:
+        second_last_dec_pos = dec_positions[-2]
+        price_plus_tax = _dec(toks[second_last_dec_pos])
+
+        sales_per = None
+        # optional third last decimal
+        if len(dec_positions) >= 3:
+            third_last_dec_pos = dec_positions[-3]
+            sales_per = _dec(toks[third_last_dec_pos])
+            name_end = third_last_dec_pos
+        else:
+            name_end = second_last_dec_pos
+
+    class_name = " ".join(toks[:name_end]).strip()
+
+    if not class_code:
         return None
-    ext_tax = _dec(m.group("ext_tax"))
-    class_name = (m.group("class_name") or "").strip()
 
     return {
         "class_code": class_code,
@@ -501,20 +602,43 @@ def _try_parse_salesclass_row(buf: str) -> Optional[Dict[str, Any]]:
         "gp_pct": gp_pct,
         "ext_tax": ext_tax,
         "price_plus_tax": price_plus_tax,
+        "sales_per": sales_per,
+        "_format": "scrambled",
     }
 
 
+def _try_parse_salesclass_row(buf: str) -> Optional[Dict[str, Any]]:
+    s = _clean_text(buf)
+    if not s:
+        return None
+    if s == "Class":
+        return None
+    if any(s.startswith(p) for p in _NOISE_PREFIXES):
+        return None
+    if any(x in s for x in _NOISE_CONTAINS):
+        return None
+    if any(s.endswith(p) for p in _NOISE_SUFFIXES):
+        return None
+
+    tokens = s.split()
+
+    # first try: true report order
+    r = _parse_report_order(tokens)
+    if r:
+        return r
+
+    # fallback: scrambled extraction
+    r = _parse_extraction_scrambled(s)
+    if r:
+        return r
+
+    return None
+
+
 def _row_required_ok(r: Dict[str, Any]) -> Tuple[bool, str]:
-    """
-    Validate required fields BEFORE attempting DB insert.
-    salesclass_daily has NOT NULL class_code; class_name should also be present.
-    """
     cc = (r.get("class_code") or "").strip()
-    cn = (r.get("class_name") or "").strip()
     if not cc:
         return False, "missing_class_code"
-    if not cn:
-        return False, "missing_class_name"
     return True, "ok"
 
 
@@ -528,9 +652,6 @@ def _extract_salesclass_rows(
     max_skip_samples: int = 5,
     max_numeric_samples: int = 5,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Returns (rows, parse_stats). Malformed rows are skipped (not fatal).
-    """
     t = (text or "").replace("\r", "\n").replace("\t", " ")
     lines = [ln.strip() for ln in t.split("\n")]
 
@@ -542,24 +663,28 @@ def _extract_salesclass_rows(
     skipped_required_reasons: Dict[str, int] = {}
     skipped_required_samples: List[Dict[str, Any]] = []
 
-    # Numeric regression instrumentation
     numeric_all_null = 0
     numeric_fail_samples: List[Dict[str, Any]] = []
 
     candidates_parsed = 0
+    fmt_report = 0
+    fmt_scrambled = 0
 
+    # Start once we hit the header "Class" OR any row-ish line (letter/number/<BLANK> at start)
     for ln in lines:
         if not ln:
             continue
 
         if not started:
-            # Start after header once we see 'Class' or a numeric row
-            if ln.strip() == "Class" or re.match(r"^[\d(]\d*\.\d{2}\s+\d", ln):
+            if ln.strip() == "Class":
                 started = True
             else:
-                continue
+                lnc = _clean_text(ln)
+                if lnc.startswith("<BLANK>") or re.match(r"^([A-Z_][A-Z0-9_]{0,10}|\d{1,4})\s+", lnc):
+                    started = True
+                else:
+                    continue
 
-        # Skip noise lines
         if any(ln.startswith(p) for p in _NOISE_PREFIXES):
             continue
         if any(x in ln for x in _NOISE_CONTAINS):
@@ -573,20 +698,26 @@ def _extract_salesclass_rows(
         if r:
             candidates_parsed += 1
 
-            # enrich
-            r["business_date"] = biz_date
-            r["source_file_id"] = source_file_id
-            r["source_sha256"] = source_sha256
-
-            # Numeric instrumentation: if all numeric fields are None, capture sample
-            numeric_fields = ["ext_price", "pct_total", "ext_cost", "profit", "gp_pct", "ext_tax", "price_plus_tax"]
-            if all(r.get(f) is None for f in numeric_fields):
+            # numeric instrumentation
+            numeric_fields = ["ext_price", "pct_total", "ext_cost", "profit", "gp_pct", "ext_tax", "price_plus_tax", "sales_per"]
+            if all(r.get(f) is None for f in numeric_fields if f != "sales_per"):
                 numeric_all_null += 1
                 if debug and len(numeric_fail_samples) < max_numeric_samples:
                     numeric_fail_samples.append({"buf": _clean_text(buf)[:400]})
 
             ok, reason = _row_required_ok(r)
             if ok:
+                r["business_date"] = biz_date
+                r["source_file_id"] = source_file_id
+                r["source_sha256"] = source_sha256
+
+                fmt = r.get("_format")
+                if fmt == "report_order":
+                    fmt_report += 1
+                elif fmt == "scrambled":
+                    fmt_scrambled += 1
+                r.pop("_format", None)
+
                 rows.append(r)
             else:
                 skipped_required += 1
@@ -596,27 +727,25 @@ def _extract_salesclass_rows(
 
             buf = ""
         else:
-            # prevent runaway buffer from killing memory
             if len(buf) > 6000:
                 buf = ln
 
-    # last buffer
+    # tail buffer
     if buf:
         r = _try_parse_salesclass_row(buf)
         if r:
             candidates_parsed += 1
-            r["business_date"] = biz_date
-            r["source_file_id"] = source_file_id
-            r["source_sha256"] = source_sha256
-
-            numeric_fields = ["ext_price", "pct_total", "ext_cost", "profit", "gp_pct", "ext_tax", "price_plus_tax"]
-            if all(r.get(f) is None for f in numeric_fields):
-                numeric_all_null += 1
-                if debug and len(numeric_fail_samples) < max_numeric_samples:
-                    numeric_fail_samples.append({"buf": _clean_text(buf)[:400]})
-
             ok, reason = _row_required_ok(r)
             if ok:
+                r["business_date"] = biz_date
+                r["source_file_id"] = source_file_id
+                r["source_sha256"] = source_sha256
+                fmt = r.get("_format")
+                if fmt == "report_order":
+                    fmt_report += 1
+                elif fmt == "scrambled":
+                    fmt_scrambled += 1
+                r.pop("_format", None)
                 rows.append(r)
             else:
                 skipped_required += 1
@@ -632,10 +761,12 @@ def _extract_salesclass_rows(
         "candidates_parsed": candidates_parsed,
         "rows_parsed": len(rows),
         "rows_skipped_required": skipped_required,
-        "rows_skipped": skipped_required,  # compatibility alias
+        "rows_skipped": skipped_required,
         "skipped_required_reasons": skipped_required_reasons,
         "numeric_all_null_rows": numeric_all_null,
         "ext_price_non_null": sum(1 for r in rows if r.get("ext_price") is not None),
+        "format_report_order_rows": fmt_report,
+        "format_scrambled_rows": fmt_scrambled,
     }
 
     if debug:
@@ -648,9 +779,6 @@ def _extract_salesclass_rows(
 
 
 def _delete_salesclass_day(cur, biz_date: date) -> Dict[str, int]:
-    """
-    Delete day from all relevant tables (idempotency).
-    """
     out = {"daily": 0, "history": 0, "effective": 0}
     try:
         cur.execute("DELETE FROM analytics.salesclass_daily WHERE business_date = %s", (biz_date,))
@@ -679,10 +807,6 @@ def _insert_salesclass_day(
     request_id: str,
     debug: bool,
 ) -> Dict[str, Any]:
-    """
-    Delete + insert for the day, skipping any rows that violate constraints.
-    Entire operation is transactional; row-level insert failures are skipped.
-    """
     try:
         conn.autocommit = False
     except Exception:
@@ -694,14 +818,12 @@ def _insert_salesclass_day(
     history = _safe_insert_rows(cur, "analytics", "salesclass_history_daily", rows, request_id=request_id, debug=debug)
     effective = _safe_insert_rows(cur, "analytics", "salesclass_effective_daily", rows, request_id=request_id, debug=debug)
 
-    # Commit transaction
     conn.commit()
-
     return {"deleted": deleted, "daily": daily, "history": history, "effective": effective}
 
 
 # -----------------------------------------------------------------------------
-# Endpoints
+# Endpoints (do not change signatures)
 # -----------------------------------------------------------------------------
 
 @app.get("/healthz")
@@ -806,7 +928,7 @@ def parse_salesclass_by_date(
         return _json_error(request_id, "exception", str(e), http_status=200)
 
 
-# NOTE: PayType / SalesStat endpoints are intentionally left in place so existing workflows don't 404.
+# PayType / SalesStat placeholders (unchanged)
 @app.post("/parse/paytype/latest")
 def parse_paytype_latest(x_parse_token: Optional[str] = Header(default=None, alias="X-Parse-Token")):
     _require_token(x_parse_token)
