@@ -102,7 +102,7 @@ async def http_exception_handler(request: Request, exc: FastAPIHTTPException):
     request_id = request.headers.get("X-Request-Id") or uuid.uuid4().hex
     status = int(getattr(exc, "status_code", 200) or 200)
 
-    # never emit 5xx from our app (502/000 were killing the workflow)
+    # never emit 5xx from our app
     http_status = status if status < 500 else 200
 
     detail = getattr(exc, "detail", None)
@@ -257,6 +257,48 @@ def _prepare_insert(cur, schema: str, table: str, rows: List[Dict[str, Any]]):
     return sql, insert_cols, cols
 
 
+def _safe_exec(
+    cur,
+    sql: str,
+    params: Tuple[Any, ...],
+    *,
+    sp_name: str,
+    request_id: str,
+    debug: bool,
+) -> Tuple[bool, int, Optional[str]]:
+    """
+    psycopg2 will mark the transaction as aborted on *any* statement error.
+    Catching doesn't fix it — you must ROLLBACK. We use SAVEPOINT for each statement.
+    """
+    try:
+        cur.execute(f"SAVEPOINT {sp_name}")
+    except Exception:
+        # if SAVEPOINT itself fails, we cannot guarantee txn health
+        return False, 0, "savepoint_failed"
+
+    try:
+        cur.execute(sql, params)
+        rc = getattr(cur, "rowcount", 0) or 0
+        cur.execute(f"RELEASE SAVEPOINT {sp_name}")
+        return True, int(rc), None
+    except Exception as e:
+        err = str(e)
+        try:
+            cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
+            cur.execute(f"RELEASE SAVEPOINT {sp_name}")
+        except Exception:
+            pass
+
+        _log(
+            "db.statement_failed",
+            request_id=request_id,
+            sp=sp_name,
+            error=err,
+            sql=sql,
+        )
+        return False, 0, err
+
+
 def _safe_insert_rows(
     cur,
     schema: str,
@@ -354,7 +396,7 @@ def _get_inbound_file(cur, report_type: str, business_date: Optional[date]) -> T
 
 
 # -----------------------------------------------------------------------------
-# SalesClass parsing (anchored to TRUE report schema; resilient to PDF glue)
+# SalesClass parsing (true report schema; glue-tolerant)
 # -----------------------------------------------------------------------------
 
 _NOISE_PREFIXES = (
@@ -373,7 +415,6 @@ _DEC2 = r"-?\d[\d,]*\.\d{2}"
 
 def _clean_text(s: str) -> str:
     s = (s or "").replace("\r", "\n").replace("\t", " ")
-    # keep literal "<BLANK>" token (it is a valid Class value)
     s = re.sub(r"\s+", " ", s).strip()
 
     # normalize "- 1960.24%" -> "-1960.24%"
@@ -389,9 +430,7 @@ def _clean_text(s: str) -> str:
     # split decimal followed by minus sign: "5.00-5.00" -> "5.00 -5.00"
     s = re.sub(r"(\d\.\d{2})(?=-)", r"\1 ", s)
 
-    # collapse
-    s = " ".join(s.split())
-    return s.strip()
+    return " ".join(s.split()).strip()
 
 
 def _dec(x: str) -> Optional[Decimal]:
@@ -415,10 +454,8 @@ def _is_class_code(tok: str) -> bool:
         return False
     if tok.upper() == "<BLANK>":
         return True
-    # numeric codes (01, 116, etc)
     if re.fullmatch(r"\d{1,4}", tok):
         return True
-    # alpha codes (AUTO, CLNG, E, _COUPO, etc)
     if re.fullmatch(r"[A-Z_][A-Z0-9_]{0,10}", tok):
         return True
     return False
@@ -426,9 +463,8 @@ def _is_class_code(tok: str) -> bool:
 
 def _parse_report_order(tokens: List[str]) -> Optional[Dict[str, Any]]:
     """
-    TRUE report schema (from screenshots):
+    Canonical report (screenshots):
       class_code, class_name (optional), ext_price, pct_total, ext_cost, profit, gp_pct%, ext_tax, price_plus_tax, sales_per
-    Works when extractor preserves left-to-right reasonably.
     """
     if not tokens:
         return None
@@ -446,8 +482,7 @@ def _parse_report_order(tokens: List[str]) -> Optional[Dict[str, Any]]:
 
     class_name = " ".join(tokens[1:i]).strip()
 
-    # now expect: ext_price pct_total ext_cost profit gp_pct% ext_tax price_plus_tax sales_per
-    need = 8
+    need = 8  # ext_price pct_total ext_cost profit gp% ext_tax price_plus_tax sales_per
     if i + need > len(tokens):
         return None
 
@@ -485,10 +520,7 @@ def _parse_report_order(tokens: List[str]) -> Optional[Dict[str, Any]]:
 
 def _parse_extraction_scrambled(s: str) -> Optional[Dict[str, Any]]:
     """
-    Handles the common PDF-extracted scramble/glue you pasted:
-      CC ext_price ext_cost profit gp% ext_tax CLASSNAME sales_per price_plus_tax pct_total
-    Also handles when CC is missing at start but appears near the end:
-      ext_price ext_cost profit gp% ext_tax CLASSNAME price_plus_tax CC pct_total
+    Fallback for scrambled extractor output (seen in your samples).
     """
     s = _clean_text(s)
     if not s or any(s.startswith(p) for p in _NOISE_PREFIXES) or any(x in s for x in _NOISE_CONTAINS) or any(s.endswith(p) for p in _NOISE_SUFFIXES):
@@ -496,7 +528,6 @@ def _parse_extraction_scrambled(s: str) -> Optional[Dict[str, Any]]:
     if s == "Class":
         return None
 
-    # locate gp% (e.g. 27.24%)
     m_gp = re.search(rf"(?P<gp>{_DEC2})%\s+", s)
     if not m_gp:
         return None
@@ -505,12 +536,10 @@ def _parse_extraction_scrambled(s: str) -> Optional[Dict[str, Any]]:
     left = s[: m_gp.start()].strip()
     right = s[m_gp.end() :].strip()
 
-    # left should end with 3 decimals: ext_price ext_cost profit, and may start with class_code
     left_toks = left.split()
     if len(left_toks) < 3:
         return None
 
-    # attempt class_code at start
     class_code: Optional[str] = None
     if left_toks and _is_class_code(left_toks[0]):
         class_code = "<BLANK>" if left_toks[0].upper() == "<BLANK>" else left_toks[0]
@@ -518,10 +547,6 @@ def _parse_extraction_scrambled(s: str) -> Optional[Dict[str, Any]]:
     else:
         num_toks = left_toks
 
-    if len(num_toks) < 3:
-        return None
-
-    # take last 3 decimals from num_toks as ext_price, ext_cost, profit (robust even if extra junk precedes)
     dec_idx = [i for i, t in enumerate(num_toks) if re.fullmatch(_DEC2, t)]
     if len(dec_idx) < 3:
         return None
@@ -530,35 +555,23 @@ def _parse_extraction_scrambled(s: str) -> Optional[Dict[str, Any]]:
     ext_cost = _dec(num_toks[b])
     profit = _dec(num_toks[c])
 
-    # now parse right: ext_tax then some text then trailing numbers
-    # ext_tax must be first decimal after gp
     m_tax = re.match(rf"^(?P<tax>{_DEC2})\s*(?P<after>.*)$", right)
     if not m_tax:
         return None
     ext_tax = _dec(m_tax.group("tax"))
     after = (m_tax.group("after") or "").strip()
 
-    # tokens in "after" may contain class_name + trailing decimals and/or class_code
-    after_clean = _clean_text(after)
-    toks = after_clean.split()
-
-    # pull all decimal tokens from end
-    # expected end usually: sales_per price_plus_tax pct_total
-    # sometimes: price_plus_tax class_code pct_total
+    toks = _clean_text(after).split()
     dec_positions = [i for i, t in enumerate(toks) if re.fullmatch(_DEC2, t)]
     if len(dec_positions) < 2:
         return None
 
-    # pct_total = last decimal token (not necessarily last token)
     last_dec_pos = dec_positions[-1]
     pct_total = _dec(toks[last_dec_pos])
 
-    # try to find class_code near end if missing at start:
-    # pattern: <decimal> <CLASSCODE> <decimal(pct_total)>
     if class_code is None:
         if last_dec_pos >= 2 and _is_class_code(toks[last_dec_pos - 1]):
             class_code = "<BLANK>" if toks[last_dec_pos - 1].upper() == "<BLANK>" else toks[last_dec_pos - 1]
-            # price_plus_tax likely the decimal before class_code (if present)
             if re.fullmatch(_DEC2, toks[last_dec_pos - 2]):
                 price_plus_tax = _dec(toks[last_dec_pos - 2])
                 sales_per = None
@@ -568,18 +581,11 @@ def _parse_extraction_scrambled(s: str) -> Optional[Dict[str, Any]]:
                 sales_per = None
                 name_end = last_dec_pos - 1
         else:
-            # cannot safely recover class_code
             return None
     else:
-        # class_code known at start, so expect last decimals include price_plus_tax and pct_total, and optionally sales_per
-        # Identify last two decimals as price_plus_tax and pct_total; optional third-from-last as sales_per
-        # We need their positions in toks:
-        # Find second last decimal token position:
         second_last_dec_pos = dec_positions[-2]
         price_plus_tax = _dec(toks[second_last_dec_pos])
-
         sales_per = None
-        # optional third last decimal
         if len(dec_positions) >= 3:
             third_last_dec_pos = dec_positions[-3]
             sales_per = _dec(toks[third_last_dec_pos])
@@ -622,12 +628,10 @@ def _try_parse_salesclass_row(buf: str) -> Optional[Dict[str, Any]]:
 
     tokens = s.split()
 
-    # first try: true report order
     r = _parse_report_order(tokens)
     if r:
         return r
 
-    # fallback: scrambled extraction
     r = _parse_extraction_scrambled(s)
     if r:
         return r
@@ -670,7 +674,6 @@ def _extract_salesclass_rows(
     fmt_report = 0
     fmt_scrambled = 0
 
-    # Start once we hit the header "Class" OR any row-ish line (letter/number/<BLANK> at start)
     for ln in lines:
         if not ln:
             continue
@@ -698,9 +701,8 @@ def _extract_salesclass_rows(
         if r:
             candidates_parsed += 1
 
-            # numeric instrumentation
             numeric_fields = ["ext_price", "pct_total", "ext_cost", "profit", "gp_pct", "ext_tax", "price_plus_tax", "sales_per"]
-            if all(r.get(f) is None for f in numeric_fields if f != "sales_per"):
+            if all(r.get(f) is None for f in numeric_fields if f not in ("sales_per",)):
                 numeric_all_null += 1
                 if debug and len(numeric_fail_samples) < max_numeric_samples:
                     numeric_fail_samples.append({"buf": _clean_text(buf)[:400]})
@@ -730,7 +732,6 @@ def _extract_salesclass_rows(
             if len(buf) > 6000:
                 buf = ln
 
-    # tail buffer
     if buf:
         r = _try_parse_salesclass_row(buf)
         if r:
@@ -740,12 +741,14 @@ def _extract_salesclass_rows(
                 r["business_date"] = biz_date
                 r["source_file_id"] = source_file_id
                 r["source_sha256"] = source_sha256
+
                 fmt = r.get("_format")
                 if fmt == "report_order":
                     fmt_report += 1
                 elif fmt == "scrambled":
                     fmt_scrambled += 1
                 r.pop("_format", None)
+
                 rows.append(r)
             else:
                 skipped_required += 1
@@ -778,23 +781,35 @@ def _extract_salesclass_rows(
     return rows, stats
 
 
-def _delete_salesclass_day(cur, biz_date: date) -> Dict[str, int]:
-    out = {"daily": 0, "history": 0, "effective": 0}
-    try:
-        cur.execute("DELETE FROM analytics.salesclass_daily WHERE business_date = %s", (biz_date,))
-        out["daily"] = getattr(cur, "rowcount", 0) or 0
-    except Exception:
-        pass
-    try:
-        cur.execute("DELETE FROM analytics.salesclass_history_daily WHERE business_date = %s", (biz_date,))
-        out["history"] = getattr(cur, "rowcount", 0) or 0
-    except Exception:
-        pass
-    try:
-        cur.execute("DELETE FROM analytics.salesclass_effective_daily WHERE business_date = %s", (biz_date,))
-        out["effective"] = getattr(cur, "rowcount", 0) or 0
-    except Exception:
-        pass
+def _delete_salesclass_day(cur, biz_date: date, *, request_id: str, debug: bool) -> Dict[str, Any]:
+    """
+    MUST use SAVEPOINT per statement to avoid psycopg2 aborting the whole transaction
+    when optional tables don't exist.
+    """
+    out: Dict[str, Any] = {"daily": 0, "history": 0, "effective": 0}
+    errors: List[Dict[str, Any]] = []
+
+    # (label, schema, table)
+    targets = [
+        ("daily", "analytics", "salesclass_daily"),
+        ("history", "analytics", "salesclass_history_daily"),
+        ("effective", "analytics", "salesclass_effective_daily"),
+    ]
+
+    for label, schema, table in targets:
+        sql = f'DELETE FROM "{schema}"."{table}" WHERE business_date = %s'
+        sp = f"sp_del_{label}"
+        ok, rc, err = _safe_exec(cur, sql, (biz_date,), sp_name=sp, request_id=request_id, debug=debug)
+        if ok:
+            out[label] = rc
+        else:
+            # missing table is fine; any error is contained by savepoint
+            if debug and err:
+                errors.append({"table": f"{schema}.{table}", "error": err})
+
+    if debug and errors:
+        out["delete_errors"] = errors
+
     return out
 
 
@@ -807,12 +822,18 @@ def _insert_salesclass_day(
     request_id: str,
     debug: bool,
 ) -> Dict[str, Any]:
+    # ensure clean transaction state
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+
     try:
         conn.autocommit = False
     except Exception:
         pass
 
-    deleted = _delete_salesclass_day(cur, biz_date)
+    deleted = _delete_salesclass_day(cur, biz_date, request_id=request_id, debug=debug)
 
     daily = _safe_insert_rows(cur, "analytics", "salesclass_daily", rows, request_id=request_id, debug=debug)
     history = _safe_insert_rows(cur, "analytics", "salesclass_history_daily", rows, request_id=request_id, debug=debug)
