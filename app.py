@@ -212,6 +212,7 @@ def _pdf_to_text(pdf_bytes: bytes) -> str:
 # -----------------------------------------------------------------------------
 
 _TABLE_COL_CACHE: Dict[Tuple[str, str], List[str]] = {}
+_TABLE_TYPE_CACHE: Dict[Tuple[str, str], str] = {}
 
 
 def _table_columns(cur, schema: str, table: str) -> List[str]:
@@ -231,6 +232,29 @@ def _table_columns(cur, schema: str, table: str) -> List[str]:
     cols = [r[0] for r in cur.fetchall()]
     _TABLE_COL_CACHE[key] = cols
     return cols
+
+
+def _table_type(cur, schema: str, table: str) -> Optional[str]:
+    """
+    Returns: 'BASE TABLE' | 'VIEW' | None (missing)
+    """
+    key = (schema, table)
+    if key in _TABLE_TYPE_CACHE:
+        return _TABLE_TYPE_CACHE[key]
+
+    cur.execute(
+        """
+        SELECT table_type
+        FROM information_schema.tables
+        WHERE table_schema = %s AND table_name = %s
+        """,
+        (schema, table),
+    )
+    row = cur.fetchone()
+    ttype = str(row[0]) if row and row[0] else None
+    if ttype:
+        _TABLE_TYPE_CACHE[key] = ttype
+    return ttype
 
 
 def _prepare_insert(cur, schema: str, table: str, rows: List[Dict[str, Any]]):
@@ -273,7 +297,6 @@ def _safe_exec(
     try:
         cur.execute(f"SAVEPOINT {sp_name}")
     except Exception:
-        # if SAVEPOINT itself fails, we cannot guarantee txn health
         return False, 0, "savepoint_failed"
 
     try:
@@ -289,13 +312,7 @@ def _safe_exec(
         except Exception:
             pass
 
-        _log(
-            "db.statement_failed",
-            request_id=request_id,
-            sp=sp_name,
-            error=err,
-            sql=sql,
-        )
+        _log("db.statement_failed", request_id=request_id, sp=sp_name, error=err, sql=sql)
         return False, 0, err
 
 
@@ -313,9 +330,16 @@ def _safe_insert_rows(
     Insert rows without aborting the day:
     - SAVEPOINT per row
     - skip DB/constraint failures
+    - skip views entirely (not insertable)
     """
     out: Dict[str, Any] = {"schema": schema, "table": table, "inserted": 0, "skipped_db": 0}
     if not rows:
+        return out
+
+    ttype = _table_type(cur, schema, table)
+    if ttype and ttype.upper() != "BASE TABLE":
+        out["note"] = f"skip_non_base_table:{ttype}"
+        _log("db.insert.skip_table", request_id=request_id, schema=schema, table=table, note=out["note"])
         return out
 
     sql, insert_cols, _cols = _prepare_insert(cur, schema, table, rows)
@@ -341,7 +365,7 @@ def _safe_insert_rows(
                 pass
 
             if debug and len(error_samples) < max_error_samples:
-                sample = {k: r.get(k) for k in ("class_code", "class_name", "ext_price", "pct_total")}
+                sample = {k: r.get(k) for k in ("class_code", "class_name", "ext_price", "pct_total", "net_sales")}
                 sample["error"] = str(e)
                 sample["row_index"] = idx
                 error_samples.append(sample)
@@ -523,7 +547,9 @@ def _parse_extraction_scrambled(s: str) -> Optional[Dict[str, Any]]:
     Fallback for scrambled extractor output (seen in your samples).
     """
     s = _clean_text(s)
-    if not s or any(s.startswith(p) for p in _NOISE_PREFIXES) or any(x in s for x in _NOISE_CONTAINS) or any(s.endswith(p) for p in _NOISE_SUFFIXES):
+    if not s or any(s.startswith(p) for p in _NOISE_PREFIXES) or any(x in s for x in _NOISE_CONTAINS) or any(
+        s.endswith(p) for p in _NOISE_SUFFIXES
+    ):
         return None
     if s == "Class":
         return None
@@ -783,13 +809,11 @@ def _extract_salesclass_rows(
 
 def _delete_salesclass_day(cur, biz_date: date, *, request_id: str, debug: bool) -> Dict[str, Any]:
     """
-    MUST use SAVEPOINT per statement to avoid psycopg2 aborting the whole transaction
-    when optional tables don't exist.
+    Use SAVEPOINT per statement; skip non-base tables (views).
     """
     out: Dict[str, Any] = {"daily": 0, "history": 0, "effective": 0}
     errors: List[Dict[str, Any]] = []
 
-    # (label, schema, table)
     targets = [
         ("daily", "analytics", "salesclass_daily"),
         ("history", "analytics", "salesclass_history_daily"),
@@ -797,18 +821,59 @@ def _delete_salesclass_day(cur, biz_date: date, *, request_id: str, debug: bool)
     ]
 
     for label, schema, table in targets:
+        ttype = _table_type(cur, schema, table)
+        if ttype and ttype.upper() != "BASE TABLE":
+            if debug:
+                errors.append({"table": f"{schema}.{table}", "error": f"skip_non_base_table:{ttype}"})
+            continue
+
         sql = f'DELETE FROM "{schema}"."{table}" WHERE business_date = %s'
         sp = f"sp_del_{label}"
         ok, rc, err = _safe_exec(cur, sql, (biz_date,), sp_name=sp, request_id=request_id, debug=debug)
         if ok:
             out[label] = rc
         else:
-            # missing table is fine; any error is contained by savepoint
             if debug and err:
                 errors.append({"table": f"{schema}.{table}", "error": err})
 
     if debug and errors:
         out["delete_errors"] = errors
+
+    return out
+
+
+def _map_rows_for_history(cur, rows_daily: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    salesclass_history_daily requires net_sales NOT NULL.
+    We map: net_sales = ext_price (the report's extended price).
+    Only include columns that exist in that table.
+    """
+    if not rows_daily:
+        return []
+
+    cols = _table_columns(cur, "analytics", "salesclass_history_daily")
+    if not cols:
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for r in rows_daily:
+        mapped: Dict[str, Any] = {
+            "business_date": r.get("business_date"),
+            "class_code": r.get("class_code"),
+            "net_sales": r.get("ext_price"),
+        }
+        # include class_name if table has it
+        if "class_name" in cols and "class_name" in r:
+            mapped["class_name"] = r.get("class_name")
+        # include source trace if those columns exist
+        if "source_file_id" in cols and "source_file_id" in r:
+            mapped["source_file_id"] = r.get("source_file_id")
+        if "source_sha256" in cols and "source_sha256" in r:
+            mapped["source_sha256"] = r.get("source_sha256")
+
+        # keep only table columns
+        mapped = {k: v for k, v in mapped.items() if k in cols}
+        out.append(mapped)
 
     return out
 
@@ -836,7 +901,12 @@ def _insert_salesclass_day(
     deleted = _delete_salesclass_day(cur, biz_date, request_id=request_id, debug=debug)
 
     daily = _safe_insert_rows(cur, "analytics", "salesclass_daily", rows, request_id=request_id, debug=debug)
-    history = _safe_insert_rows(cur, "analytics", "salesclass_history_daily", rows, request_id=request_id, debug=debug)
+
+    # history: map to net_sales shape
+    rows_history = _map_rows_for_history(cur, rows)
+    history = _safe_insert_rows(cur, "analytics", "salesclass_history_daily", rows_history, request_id=request_id, debug=debug)
+
+    # effective is a view in your DB; we skip it (handled inside _safe_insert_rows / _delete_salesclass_day)
     effective = _safe_insert_rows(cur, "analytics", "salesclass_effective_daily", rows, request_id=request_id, debug=debug)
 
     conn.commit()
