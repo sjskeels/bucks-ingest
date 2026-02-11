@@ -212,7 +212,6 @@ def _pdf_to_text(pdf_bytes: bytes) -> str:
 # -----------------------------------------------------------------------------
 
 _TABLE_COL_CACHE: Dict[Tuple[str, str], List[str]] = {}
-_TABLE_TYPE_CACHE: Dict[Tuple[str, str], str] = {}
 
 
 def _table_columns(cur, schema: str, table: str) -> List[str]:
@@ -232,29 +231,6 @@ def _table_columns(cur, schema: str, table: str) -> List[str]:
     cols = [r[0] for r in cur.fetchall()]
     _TABLE_COL_CACHE[key] = cols
     return cols
-
-
-def _table_type(cur, schema: str, table: str) -> Optional[str]:
-    """
-    Returns: 'BASE TABLE' | 'VIEW' | None (missing)
-    """
-    key = (schema, table)
-    if key in _TABLE_TYPE_CACHE:
-        return _TABLE_TYPE_CACHE[key]
-
-    cur.execute(
-        """
-        SELECT table_type
-        FROM information_schema.tables
-        WHERE table_schema = %s AND table_name = %s
-        """,
-        (schema, table),
-    )
-    row = cur.fetchone()
-    ttype = str(row[0]) if row and row[0] else None
-    if ttype:
-        _TABLE_TYPE_CACHE[key] = ttype
-    return ttype
 
 
 def _prepare_insert(cur, schema: str, table: str, rows: List[Dict[str, Any]]):
@@ -312,7 +288,13 @@ def _safe_exec(
         except Exception:
             pass
 
-        _log("db.statement_failed", request_id=request_id, sp=sp_name, error=err, sql=sql)
+        _log(
+            "db.statement_failed",
+            request_id=request_id,
+            sp=sp_name,
+            error=err,
+            sql=sql,
+        )
         return False, 0, err
 
 
@@ -330,16 +312,9 @@ def _safe_insert_rows(
     Insert rows without aborting the day:
     - SAVEPOINT per row
     - skip DB/constraint failures
-    - skip views entirely (not insertable)
     """
     out: Dict[str, Any] = {"schema": schema, "table": table, "inserted": 0, "skipped_db": 0}
     if not rows:
-        return out
-
-    ttype = _table_type(cur, schema, table)
-    if ttype and ttype.upper() != "BASE TABLE":
-        out["note"] = f"skip_non_base_table:{ttype}"
-        _log("db.insert.skip_table", request_id=request_id, schema=schema, table=table, note=out["note"])
         return out
 
     sql, insert_cols, _cols = _prepare_insert(cur, schema, table, rows)
@@ -365,7 +340,7 @@ def _safe_insert_rows(
                 pass
 
             if debug and len(error_samples) < max_error_samples:
-                sample = {k: r.get(k) for k in ("class_code", "class_name", "ext_price", "pct_total", "net_sales")}
+                sample = {k: r.get(k) for k in ("class_code", "class_name", "ext_price", "pct_total")}
                 sample["error"] = str(e)
                 sample["row_index"] = idx
                 error_samples.append(sample)
@@ -487,8 +462,9 @@ def _is_class_code(tok: str) -> bool:
 
 def _parse_report_order(tokens: List[str]) -> Optional[Dict[str, Any]]:
     """
-    Canonical report (screenshots):
-      class_code, class_name (optional), ext_price, pct_total, ext_cost, profit, gp_pct%, ext_tax, price_plus_tax, sales_per
+    Canonical TransAct report order (your screenshot + 01/27 PDF extracted text):
+      class_code, class_name (optional),
+      ext_price, ext_cost, profit, gp_pct%, ext_tax, sales_per, price_plus_tax, pct_total
     """
     if not tokens:
         return None
@@ -506,23 +482,25 @@ def _parse_report_order(tokens: List[str]) -> Optional[Dict[str, Any]]:
 
     class_name = " ".join(tokens[1:i]).strip()
 
-    need = 8  # ext_price pct_total ext_cost profit gp% ext_tax price_plus_tax sales_per
+    # need 8 tokens after ext_price:
+    # ext_price ext_cost profit gp% ext_tax sales_per price_plus_tax pct_total
+    need = 8
     if i + need > len(tokens):
         return None
 
     ext_price = _dec(tokens[i])
-    pct_total = _dec(tokens[i + 1])
-    ext_cost = _dec(tokens[i + 2])
-    profit = _dec(tokens[i + 3])
+    ext_cost = _dec(tokens[i + 1])
+    profit = _dec(tokens[i + 2])
 
-    gp_tok = tokens[i + 4]
+    gp_tok = tokens[i + 3]
     if not gp_tok.endswith("%"):
         return None
     gp_pct = _dec(gp_tok.replace("%", ""))
 
-    ext_tax = _dec(tokens[i + 5])
+    ext_tax = _dec(tokens[i + 4])
+    sales_per = _dec(tokens[i + 5])
     price_plus_tax = _dec(tokens[i + 6])
-    sales_per = _dec(tokens[i + 7])
+    pct_total = _dec(tokens[i + 7])
 
     if ext_price is None or ext_cost is None or profit is None or gp_pct is None:
         return None
@@ -531,24 +509,27 @@ def _parse_report_order(tokens: List[str]) -> Optional[Dict[str, Any]]:
         "class_code": "<BLANK>" if cc.upper() == "<BLANK>" else cc,
         "class_name": class_name,
         "ext_price": ext_price,
-        "pct_total": pct_total,
         "ext_cost": ext_cost,
         "profit": profit,
         "gp_pct": gp_pct,
         "ext_tax": ext_tax,
-        "price_plus_tax": price_plus_tax,
         "sales_per": sales_per,
+        "price_plus_tax": price_plus_tax,
+        "pct_total": pct_total,
         "_format": "report_order",
     }
 
 
 def _parse_extraction_scrambled(s: str) -> Optional[Dict[str, Any]]:
     """
-    Fallback for scrambled extractor output (seen in your samples).
+    Fallback for scrambled extractor output.
     """
     s = _clean_text(s)
-    if not s or any(s.startswith(p) for p in _NOISE_PREFIXES) or any(x in s for x in _NOISE_CONTAINS) or any(
-        s.endswith(p) for p in _NOISE_SUFFIXES
+    if (
+        not s
+        or any(s.startswith(p) for p in _NOISE_PREFIXES)
+        or any(x in s for x in _NOISE_CONTAINS)
+        or any(s.endswith(p) for p in _NOISE_SUFFIXES)
     ):
         return None
     if s == "Class":
@@ -589,35 +570,33 @@ def _parse_extraction_scrambled(s: str) -> Optional[Dict[str, Any]]:
 
     toks = _clean_text(after).split()
     dec_positions = [i for i, t in enumerate(toks) if re.fullmatch(_DEC2, t)]
-    if len(dec_positions) < 2:
+    if len(dec_positions) < 1:
         return None
 
+    # pct_total is usually the last decimal in the remaining tail
     last_dec_pos = dec_positions[-1]
     pct_total = _dec(toks[last_dec_pos])
 
-    if class_code is None:
-        if last_dec_pos >= 2 and _is_class_code(toks[last_dec_pos - 1]):
-            class_code = "<BLANK>" if toks[last_dec_pos - 1].upper() == "<BLANK>" else toks[last_dec_pos - 1]
-            if re.fullmatch(_DEC2, toks[last_dec_pos - 2]):
-                price_plus_tax = _dec(toks[last_dec_pos - 2])
-                sales_per = None
-                name_end = last_dec_pos - 2
-            else:
-                price_plus_tax = None
-                sales_per = None
-                name_end = last_dec_pos - 1
+    # Heuristic: many extracts produce: <desc> <ext_price_again> <price_plus_tax> <pct_total>
+    # (sales_per often missing in scrambled format)
+    price_plus_tax = None
+    sales_per = None
+    name_end = last_dec_pos
+
+    if len(dec_positions) >= 2:
+        price_plus_tax = _dec(toks[dec_positions[-2]])
+        name_end = dec_positions[-2]
+
+    if len(dec_positions) >= 3:
+        # If the first of the tail decimals equals ext_price, treat it as a repeated ext_price (not sales_per)
+        first_tail = _dec(toks[dec_positions[-3]])
+        if first_tail is not None and ext_price is not None and first_tail == ext_price:
+            sales_per = None
+            name_end = dec_positions[-3]
         else:
-            return None
-    else:
-        second_last_dec_pos = dec_positions[-2]
-        price_plus_tax = _dec(toks[second_last_dec_pos])
-        sales_per = None
-        if len(dec_positions) >= 3:
-            third_last_dec_pos = dec_positions[-3]
-            sales_per = _dec(toks[third_last_dec_pos])
-            name_end = third_last_dec_pos
-        else:
-            name_end = second_last_dec_pos
+            # Otherwise treat it as sales_per
+            sales_per = first_tail
+            name_end = dec_positions[-3]
 
     class_name = " ".join(toks[:name_end]).strip()
 
@@ -727,7 +706,16 @@ def _extract_salesclass_rows(
         if r:
             candidates_parsed += 1
 
-            numeric_fields = ["ext_price", "pct_total", "ext_cost", "profit", "gp_pct", "ext_tax", "price_plus_tax", "sales_per"]
+            numeric_fields = [
+                "ext_price",
+                "pct_total",
+                "ext_cost",
+                "profit",
+                "gp_pct",
+                "ext_tax",
+                "price_plus_tax",
+                "sales_per",
+            ]
             if all(r.get(f) is None for f in numeric_fields if f not in ("sales_per",)):
                 numeric_all_null += 1
                 if debug and len(numeric_fail_samples) < max_numeric_samples:
@@ -809,72 +797,22 @@ def _extract_salesclass_rows(
 
 def _delete_salesclass_day(cur, biz_date: date, *, request_id: str, debug: bool) -> Dict[str, Any]:
     """
-    Use SAVEPOINT per statement; skip non-base tables (views).
+    Delete only from the writable daily table.
+    (history/effective are intentionally not written by this service.)
     """
-    out: Dict[str, Any] = {"daily": 0, "history": 0, "effective": 0}
+    out: Dict[str, Any] = {"daily": 0}
     errors: List[Dict[str, Any]] = []
 
-    targets = [
-        ("daily", "analytics", "salesclass_daily"),
-        ("history", "analytics", "salesclass_history_daily"),
-        ("effective", "analytics", "salesclass_effective_daily"),
-    ]
-
-    for label, schema, table in targets:
-        ttype = _table_type(cur, schema, table)
-        if ttype and ttype.upper() != "BASE TABLE":
-            if debug:
-                errors.append({"table": f"{schema}.{table}", "error": f"skip_non_base_table:{ttype}"})
-            continue
-
-        sql = f'DELETE FROM "{schema}"."{table}" WHERE business_date = %s'
-        sp = f"sp_del_{label}"
-        ok, rc, err = _safe_exec(cur, sql, (biz_date,), sp_name=sp, request_id=request_id, debug=debug)
-        if ok:
-            out[label] = rc
-        else:
-            if debug and err:
-                errors.append({"table": f"{schema}.{table}", "error": err})
+    sql = 'DELETE FROM "analytics"."salesclass_daily" WHERE business_date = %s'
+    ok, rc, err = _safe_exec(cur, sql, (biz_date,), sp_name="sp_del_daily", request_id=request_id, debug=debug)
+    if ok:
+        out["daily"] = rc
+    else:
+        if debug and err:
+            errors.append({"table": "analytics.salesclass_daily", "error": err})
 
     if debug and errors:
         out["delete_errors"] = errors
-
-    return out
-
-
-def _map_rows_for_history(cur, rows_daily: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    salesclass_history_daily requires net_sales NOT NULL.
-    We map: net_sales = ext_price (the report's extended price).
-    Only include columns that exist in that table.
-    """
-    if not rows_daily:
-        return []
-
-    cols = _table_columns(cur, "analytics", "salesclass_history_daily")
-    if not cols:
-        return []
-
-    out: List[Dict[str, Any]] = []
-    for r in rows_daily:
-        mapped: Dict[str, Any] = {
-            "business_date": r.get("business_date"),
-            "class_code": r.get("class_code"),
-            "net_sales": r.get("ext_price"),
-        }
-        # include class_name if table has it
-        if "class_name" in cols and "class_name" in r:
-            mapped["class_name"] = r.get("class_name")
-        # include source trace if those columns exist
-        if "source_file_id" in cols and "source_file_id" in r:
-            mapped["source_file_id"] = r.get("source_file_id")
-        if "source_sha256" in cols and "source_sha256" in r:
-            mapped["source_sha256"] = r.get("source_sha256")
-
-        # keep only table columns
-        mapped = {k: v for k, v in mapped.items() if k in cols}
-        out.append(mapped)
-
     return out
 
 
@@ -887,7 +825,11 @@ def _insert_salesclass_day(
     request_id: str,
     debug: bool,
 ) -> Dict[str, Any]:
-    # ensure clean transaction state
+    """
+    Insert ONLY into analytics.salesclass_daily.
+    - salesclass_effective_daily is a view (not updatable)
+    - salesclass_history_daily currently requires net_sales we don't provide
+    """
     try:
         conn.rollback()
     except Exception:
@@ -902,15 +844,14 @@ def _insert_salesclass_day(
 
     daily = _safe_insert_rows(cur, "analytics", "salesclass_daily", rows, request_id=request_id, debug=debug)
 
-    # history: map to net_sales shape
-    rows_history = _map_rows_for_history(cur, rows)
-    history = _safe_insert_rows(cur, "analytics", "salesclass_history_daily", rows_history, request_id=request_id, debug=debug)
-
-    # effective is a view in your DB; we skip it (handled inside _safe_insert_rows / _delete_salesclass_day)
-    effective = _safe_insert_rows(cur, "analytics", "salesclass_effective_daily", rows, request_id=request_id, debug=debug)
-
     conn.commit()
-    return {"deleted": deleted, "daily": daily, "history": history, "effective": effective}
+
+    return {
+        "deleted": deleted,
+        "daily": daily,
+        "history": {"schema": "analytics", "table": "salesclass_history_daily", "inserted": 0, "skipped_db": len(rows), "note": "not_written_by_service"},
+        "effective": {"schema": "analytics", "table": "salesclass_effective_daily", "inserted": 0, "skipped_db": len(rows), "note": "view_not_updatable"},
+    }
 
 
 # -----------------------------------------------------------------------------
